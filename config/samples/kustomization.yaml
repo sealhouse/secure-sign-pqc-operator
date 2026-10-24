@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- pqc_v1alpha1_securesignpqc.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
