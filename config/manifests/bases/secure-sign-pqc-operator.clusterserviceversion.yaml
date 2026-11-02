@@ -1,0 +1,54 @@
+# The hand-written part of the operator's ClusterServiceVersion.
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: secure-sign-pqc-operator.v0.0.0
+  annotations:
+    capabilities: Seamless Upgrades
+    categories: Security
+    description: Runs a post-quantum (ML-DSA) Sigstore signing stack.
+    repository: https://github.com/sealhouse/secure-sign-pqc-operator
+    support: sealhouse
+    operatorframework.io/suggested-namespace: rhtas-pqc-operator
+spec:
+  displayName: Red Hat Trusted Artifact Signer PQC
+  description: |
+    Deploys Sigstore services that sign and verify only with ML-DSA
+    (FIPS 204). Each SecureSignPQC names the product version it runs in
+    spec.version, so one operator runs several product versions side by side.
+
+    This build is from the alpha channel: every merge to the operator's main
+    branch publishes a new bundle, and each bundle replaces the previous one.
+  provider:
+    name: sealhouse
+    url: https://github.com/sealhouse
+  maintainers:
+    - name: sealhouse
+  links:
+    - name: Source
+      url: https://github.com/sealhouse/secure-sign-pqc-operator
+  keywords:
+    - sigstore
+    - signing
+    - post-quantum
+    - ml-dsa
+    - timestamp
+  maturity: alpha
+  minKubeVersion: 1.33.0
+  # The OLM v1 lane installs cluster-wide, so AllNamespaces is the only mode.
+  installModes:
+    - type: OwnNamespace
+      supported: false
+    - type: SingleNamespace
+      supported: false
+    - type: MultiNamespace
+      supported: false
+    - type: AllNamespaces
+      supported: true
+  customresourcedefinitions:
+    owned:
+      - name: securesignpqcs.pqc.rhtas.redhat.com
+        version: v1alpha1
+        kind: SecureSignPQC
+        displayName: SecureSign PQC
+        description: One PQC signing deployment at a given product version.

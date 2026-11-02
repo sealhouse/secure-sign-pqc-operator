@@ -1,4 +1,28 @@
-# This patch adds the args to allow exposing the metrics endpoint using HTTPS
 - op: add
   path: /spec/template/spec/containers/0/args/0
   value: --metrics-bind-address=:8443
+# Without the service-ca certificate the manager serves a self-signed one.
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --metrics-cert-path=/var/run/secrets/metrics-cert
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts
+  value:
+  - name: metrics-cert
+    mountPath: /var/run/secrets/metrics-cert
+    readOnly: true
+- op: add
+  path: /spec/template/spec/volumes
+  value:
+  - name: metrics-cert
+    secret:
+      secretName: rhtas-pqc-metrics-cert
+      optional: true
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: METRICS_SERVICE
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: METRICS_SCRAPER

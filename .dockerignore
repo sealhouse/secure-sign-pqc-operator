@@ -12,3 +12,6 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Embedded per-version image pins
+!versions/*/images.env

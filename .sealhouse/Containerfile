@@ -1,0 +1,19 @@
+# sealhouse build of the RHTAS PQC operator on Red Hat Hardened Images (Hummingbird).
+ARG BUILDER
+ARG RUNTIME
+
+FROM ${BUILDER} AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY api/ api/
+COPY internal/ internal/
+COPY versions/ versions/
+ARG LDFLAGS=""
+RUN CGO_ENABLED=0 GOFIPS140=v1.26.0 go build -trimpath -ldflags "-buildid= ${LDFLAGS}" \
+      -o /out/usr/local/bin/manager ./cmd
+
+FROM ${RUNTIME}
+COPY --from=builder /out/usr/local/bin/manager /usr/local/bin/manager
+ENTRYPOINT ["/usr/local/bin/manager"]

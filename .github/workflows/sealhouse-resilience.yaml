@@ -1,0 +1,53 @@
+name: sealhouse-resilience
+
+on:
+  schedule:
+    - cron: '40 9 * * *'
+  workflow_dispatch:
+    inputs:
+      run:
+        description: Test name regex
+        default: ^TestResilience
+      long:
+        description: Include the 10-minute outage
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  resilience:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.access.redhat.com/hi/go:1.27-fips-builder@sha256:f52a13d77128a7be1e46d91d18a211cf401c94b0b2dea25272eef2136f8bc43c
+    timeout-minutes: 60
+    env:
+      LOCALBIN: /tmp/sealhouse-bin
+      RESILIENCE_RUN: ${{ inputs.run || '^TestResilience' }}
+      RESILIENCE_LONG: ${{ (github.event_name == 'schedule' || inputs.long) && '1' || '' }}
+      RESILIENCE_TIMEOUT: ${{ (github.event_name == 'schedule' || inputs.long) && '45m' || '30m' }}
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$PWD"
+          [ -z "${ACT:-}" ] || exit 0
+          git init -q .
+          git fetch -q --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Tree before
+        run: |
+          { git status --porcelain; git diff; } > /tmp/tree-before
+      - name: Toolchain
+        run: |
+          go version
+          go env GOFIPS140 GOOS GOARCH
+      - name: Tools
+        run: |
+          mkdir -p "$LOCALBIN"
+          make setup-envtest toxiproxy LOCALBIN="$LOCALBIN"
+      - name: Resilience scenarios
+        run: make test-resilience LOCALBIN="$LOCALBIN"
+      - name: Generated and formatted files unchanged
+        run: |
+          { git status --porcelain; git diff; } > /tmp/tree-after
+          git diff --no-index --exit-code /tmp/tree-before /tmp/tree-after

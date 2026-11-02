@@ -1,10 +1,4 @@
-# This rule is not used by the project secure-sign-pqc-operator itself.
-# It is provided to allow the cluster admin to help manage permissions for users.
-#
-# Grants permissions to create, update, and delete resources within the pqc.rhtas.redhat.com.
-# This role is intended for users who need to manage these resources
-# but should not control RBAC or manage permissions for others.
-
+# Create, change and delete SecureSignPQC, for users to bind; the operator does not use it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

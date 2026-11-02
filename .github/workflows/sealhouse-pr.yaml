@@ -1,0 +1,15 @@
+name: sealhouse-pr
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  pr:
+    uses: sealhouse/ci/.github/workflows/pr.yaml@3d709872411ce0658c40ec5619750de80ab74257
+    with:
+      ci-ref: 3d709872411ce0658c40ec5619750de80ab74257
+      lint: lint
+      e2e: test-e2e

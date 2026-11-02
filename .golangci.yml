@@ -1,6 +1,11 @@
 version: "2"
 run:
   allow-parallel-runners: true
+  # The e2e, soak and resilience suites build only with their tags.
+  build-tags:
+    - e2e
+    - soak
+    - resilience
 linters:
   default: none
   enable:
@@ -51,7 +56,11 @@ linters:
       - linters:
           - dupl
           - lll
-        path: internal/*
+        path: (internal|tools)/*
+      # Test fixtures repeat names and versions ("demo", "2.0") on purpose.
+      - linters:
+          - goconst
+        path: _test\.go$
     paths:
       - third_party$
       - builtin$
