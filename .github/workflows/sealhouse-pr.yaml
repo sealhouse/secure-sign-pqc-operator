@@ -13,3 +13,6 @@ jobs:
       ci-ref: 0921e2399d488dd3b68f112ab1b6c819387aec70
       lint: lint
       e2e: test-e2e
+    secrets:
+      dispatch-app-id: ${{ secrets.SEALHOUSE_DISPATCH_APP_ID }}
+      dispatch-app-key: ${{ secrets.SEALHOUSE_DISPATCH_APP_KEY }}
