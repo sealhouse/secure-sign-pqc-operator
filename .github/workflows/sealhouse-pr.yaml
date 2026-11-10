@@ -8,9 +8,9 @@ permissions: {}
 
 jobs:
   pr:
-    uses: sealhouse/ci/.github/workflows/pr.yaml@b1d5b917f99d991f75e4c97ed9ecb20d427d7fa8
+    uses: sealhouse/ci/.github/workflows/pr.yaml@75a727d99331491cd1ab3d8eb874e7988da95b06
     with:
-      ci-ref: b1d5b917f99d991f75e4c97ed9ecb20d427d7fa8
+      ci-ref: 75a727d99331491cd1ab3d8eb874e7988da95b06
       lint: lint
       e2e: test-e2e
     secrets:
