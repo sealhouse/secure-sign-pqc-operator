@@ -1,8 +1,8 @@
 name: sealhouse-resilience
+run-name: ${{ inputs.timer }}
 
+# ci's sealhouse-timer starts it daily, with the long outage.
 on:
-  schedule:
-    - cron: '40 9 * * *'
   workflow_dispatch:
     inputs:
       run:
@@ -12,6 +12,9 @@ on:
         description: Include the 10-minute outage
         type: boolean
         default: false
+      timer:
+        description: set by sealhouse-timer, which names the run after it
+        default: ''
 
 permissions: {}
 
@@ -24,8 +27,8 @@ jobs:
     env:
       LOCALBIN: /tmp/sealhouse-bin
       RESILIENCE_RUN: ${{ inputs.run || '^TestResilience' }}
-      RESILIENCE_LONG: ${{ (github.event_name == 'schedule' || inputs.long) && '1' || '' }}
-      RESILIENCE_TIMEOUT: ${{ (github.event_name == 'schedule' || inputs.long) && '45m' || '30m' }}
+      RESILIENCE_LONG: ${{ inputs.long && '1' || '' }}
+      RESILIENCE_TIMEOUT: ${{ inputs.long && '45m' || '30m' }}
     steps:
       - name: Checkout
         run: |
