@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	prototrustroot "github.com/sigstore/protobuf-specs/gen/pb-go/trustroot/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pqcv1alpha1 "github.com/sealhouse/secure-sign-pqc-operator/api/v1alpha1"
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/pki"
@@ -203,13 +208,15 @@ func TestTSADeploymentRollsOnSignerChange(t *testing.T) {
 // The pods mount the current signer and nothing else: the intermediate CA
 // key stays out of every pod.
 func TestTSADeploymentMountsOnlyTheSigner(t *testing.T) {
-	d := renderTSA(t, testInstance(), TSASignerSecretName("demo", 3), testSigner, "")
+	d := renderTSA(t, testInstance(), TSASignerSecretName("demo", 1, 1, 3), testSigner, "")
 	raw, err := json.Marshal(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), TSACASecretName("demo")) || strings.Contains(string(raw), pki.IntermediateKeyPEM) {
-		t.Fatal("pod spec references the TSA CA Secret")
+	for _, ca := range []string{TSAIntermediateSecretName("demo", 1, 1), TSARootSecretName("demo", 1), pki.IntermediateKeyPEM, pki.RootKeyPEM} {
+		if strings.Contains(string(raw), ca) {
+			t.Fatalf("pod spec references %s", ca)
+		}
 	}
 	var secrets []string
 	for _, v := range d.Spec.Template.Spec.Volumes {
@@ -217,27 +224,30 @@ func TestTSADeploymentMountsOnlyTheSigner(t *testing.T) {
 			secrets = append(secrets, *v.Secret.SecretName)
 		}
 	}
-	if !slices.Equal(secrets, []string{"demo-tsa-signer-3"}) {
-		t.Fatalf("secret volumes %v, want [demo-tsa-signer-3]", secrets)
+	if !slices.Equal(secrets, []string{"demo-tsa-signer-1-1-3"}) {
+		t.Fatalf("secret volumes %v, want [demo-tsa-signer-1-1-3]", secrets)
 	}
 }
 
-func TestSignerToInstance(t *testing.T) {
+func TestKeyToInstance(t *testing.T) {
 	secret := func(name string, labels map[string]string) *corev1.Secret {
 		return &corev1.Secret{Namespace: "ns", Name: name, Labels: labels}
 	}
 	cr := testInstance()
-	signer := keySecretLabels(cr, RoleTSASigner)
+	signer := tsaCA.genLabels(cr, RoleTSASigner, caGen{1, 1})
 	signer[LabelKeyGeneration] = "4"
 	for name, tc := range map[string]struct {
-		obj  *corev1.Secret
+		obj  client.Object
 		want int
 	}{
-		"signer":    {secret("demo-tsa-signer-4", signer), 1},
-		"ca":        {secret("demo-tsa-ca", keySecretLabels(cr, RoleTSACA)), 1},
-		"unrelated": {secret("other", map[string]string{LabelInstance: "demo"}), 0},
+		"signer":       {secret("demo-tsa-signer-1-1-4", signer), 1},
+		"root":         {secret("demo-tsa-root-1", tsaCA.labels(cr, RoleTSARoot)), 1},
+		"intermediate": {secret("demo-tsa-intermediate-1-1", tsaCA.genLabels(cr, RoleTSAIntermediate, caGen{1, 1})), 1},
+		"chain":        {&corev1.ConfigMap{Namespace: "ns", Name: "demo-tsa-chain-1-1", Labels: tsaCA.genLabels(cr, RoleTSAChain, caGen{1, 1})}, 1},
+		"trusted root": {&corev1.ConfigMap{Namespace: "ns", Name: "demo-trusted-root", Labels: map[string]string{LabelName: "trusted-root", LabelInstance: "demo"}}, 1},
+		"unrelated":    {secret("other", map[string]string{LabelInstance: "demo"}), 0},
 	} {
-		got := signerToInstance(context.Background(), tc.obj)
+		got := keyToInstance(context.Background(), tc.obj)
 		if len(got) != tc.want || (tc.want == 1 && got[0].Name != "demo") {
 			t.Errorf("%s: %v", name, got)
 		}
@@ -254,46 +264,79 @@ func TestTSAService(t *testing.T) {
 	}
 }
 
+// testCA is one root and intermediate, the root issued at rootIssued and
+// the intermediate at intIssued; withRootKey keeps the root's key Secret,
+// as instances created since CA rotation do.
+func testCA(t *testing.T, gen caGen, rootIssued, intIssued time.Time, withRootKey bool) *caState {
+	t.Helper()
+	root, err := pki.NewRoot(pqcv1alpha1.MLDSA44, "test root", rootIssued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := root.IssueIntermediate(pqcv1alpha1.MLDSA44, "test intermediate", pki.TSAIntermediateEKU, intIssued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &caState{cas: []caKey{{gen: gen, secret: &corev1.Secret{}, ca: ca}}, want: gen}
+	if withRootKey {
+		st.roots = []rootKey{{gen: gen.root, secret: &corev1.Secret{}, root: root}}
+	}
+	st.target = &st.cas[0]
+	return st
+}
+
 func TestCheckExpiry(t *testing.T) {
 	const year = 365 * 24 * time.Hour
+	const month = 30 * 24 * time.Hour
 	now := time.Now()
-	ca, err := pki.NewTSACA(pqcv1alpha1.MLDSA44, "test", now.Add(-15*year+30*24*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	freshCA, err := pki.NewTSACA(pqcv1alpha1.MLDSA44, "test", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer := func(ca *pki.TSACA, issued time.Time) *tsaSigner {
-		leaf, err := ca.IssueLeaf(pqcv1alpha1.MLDSA44, "test", issued)
+	fresh := testCA(t, caGen{1, 1}, now, now, true)
+	expiringInt := testCA(t, caGen{1, 1}, now, now.Add(-5*year+month), true)
+	// Issued with less than an intermediate's lifetime left on the root,
+	// so it ends with the root.
+	endsWithRoot := testCA(t, caGen{1, 1}, now.Add(-10*year+month), now.Add(-4*year), true)
+	noRootKey := testCA(t, caGen{1, 1}, now, now.Add(-5*year+month), false)
+	rotating := testCA(t, caGen{1, 2}, now, now, true)
+	rotating.cas = append(rotating.cas, expiringInt.cas[0])
+	rotating.target = &rotating.cas[0]
+
+	signer := func(st *caState, k int, issued time.Time) *tsaSigner {
+		leaf, err := st.cas[k].ca.IssueLeaf(pqcv1alpha1.MLDSA44, "test", issued)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return &tsaSigner{generation: 2, chain: leaf}
+		return &tsaSigner{generation: 2, ca: st.cas[k].gen, chain: leaf}
 	}
-	older := func(s *tsaSigner) []tsaSigner { return []tsaSigner{{generation: 1, chain: s.chain}} }
-	expiringSigner := signer(freshCA, now.Add(-10*year+30*24*time.Hour))
+	older := func(s *tsaSigner) []tsaSigner {
+		o := *s
+		o.generation = 1
+		return []tsaSigner{o}
+	}
+	expiringSigner := signer(fresh, 0, now.Add(-year+month))
 	for name, tc := range map[string]struct {
-		ca     *pki.TSACA
+		st     *caState
 		signer *tsaSigner
 		older  []tsaSigner
 		status metav1.ConditionStatus
 		reason string
 		says   string
 	}{
-		"fresh":          {freshCA, signer(freshCA, now), nil, metav1.ConditionFalse, "NotExpiring", ""},
-		"signer":         {freshCA, expiringSigner, nil, metav1.ConditionTrue, "SignerExpiring", "raise spec.tsa.signing.signerGeneration"},
-		"intermediate":   {ca, signer(ca, now), nil, metav1.ConditionTrue, "CAExpiring", "intermediate CA"},
-		"signer at CA":   {ca, signer(ca, now.Add(-10*year+30*24*time.Hour)), nil, metav1.ConditionTrue, "CAExpiring", "intermediate CA"},
-		"outside window": {freshCA, signer(freshCA, now.Add(-9*year)), nil, metav1.ConditionFalse, "NotExpiring", ""},
-		"older serving":  {freshCA, signer(freshCA, now), older(expiringSigner), metav1.ConditionTrue, "SignerExpiring", "generation 1 (in use until generation 2 rolls out)"},
+		"fresh":            {fresh, signer(fresh, 0, now), nil, metav1.ConditionFalse, "NotExpiring", ""},
+		"signer":           {fresh, expiringSigner, nil, metav1.ConditionTrue, "SignerExpiring", "raise spec.tsa.signing.signerGeneration"},
+		"intermediate":     {expiringInt, signer(expiringInt, 0, now), nil, metav1.ConditionTrue, "CAExpiring", "intermediate CA 1-1 certificate expires at"},
+		"intermediate fix": {expiringInt, signer(expiringInt, 0, now), nil, metav1.ConditionTrue, "CAExpiring", "raise spec.tsa.signing.intermediateGeneration"},
+		"ends with root":   {endsWithRoot, signer(endsWithRoot, 0, now), nil, metav1.ConditionTrue, "CAExpiring", "raise spec.tsa.signing.rootGeneration"},
+		"no root key":      {noRootKey, signer(noRootKey, 0, now), nil, metav1.ConditionTrue, "CAExpiring", "raise spec.tsa.signing.rootGeneration"},
+		"signer at CA":     {expiringInt, signer(expiringInt, 0, now.Add(-year+month)), nil, metav1.ConditionTrue, "CAExpiring", "intermediate CA"},
+		"outside window":   {fresh, signer(fresh, 0, now.Add(-year/2)), nil, metav1.ConditionFalse, "NotExpiring", ""},
+		"older serving":    {fresh, signer(fresh, 0, now), older(expiringSigner), metav1.ConditionTrue, "SignerExpiring", "generation 1 of intermediate 1-1 (in use until generation 2 rolls out)"},
+		"old CA rotating":  {rotating, signer(rotating, 0, now), nil, metav1.ConditionTrue, "CAExpiring", "finish that rollout"},
 	} {
 		events := &recordedEvents{}
 		r := &SecureSignPQCReconciler{Settings: tuning.NewLive(tuning.Defaults()), Recorder: events}
 		cr := testInstance()
+		soon := now.Add(r.Settings.Load().ExpiryWarning)
 		for range 2 {
-			r.checkExpiry(cr, tc.ca, tc.signer, tc.older, now)
+			r.checkExpiry(cr, tsaExpiryChecks(tc.st, tc.signer, tc.older, soon), soon)
 		}
 		c := meta.FindStatusCondition(cr.Status.Conditions, pqcv1alpha1.ConditionCertificatesExpiring)
 		if c == nil || c.Status != tc.status || c.Reason != tc.reason || !strings.Contains(c.Message, tc.says) {
@@ -316,26 +359,24 @@ func (e *recordedEvents) Eventf(_ runtime.Object, _ runtime.Object, _, reason, _
 // on the next pass; status must report it once, from the Secret.
 func TestSetTSAKeysListsEachGenerationOnce(t *testing.T) {
 	now := time.Now()
-	ca, err := pki.NewTSACA(pqcv1alpha1.MLDSA65, "test", now)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := testCA(t, caGen{1, 1}, now, now, true)
+	records := []chainRecord{{gen: st.target.gen, chain: st.target.ca}}
 	signer := func(gen int32) tsaSigner {
-		leaf, err := ca.IssueLeaf(pqcv1alpha1.MLDSA65, "test", now)
+		leaf, err := st.target.ca.IssueLeaf(pqcv1alpha1.MLDSA65, "test", now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return tsaSigner{generation: gen, chain: leaf}
+		return tsaSigner{generation: gen, ca: st.target.gen, chain: leaf}
 	}
 	one, two, three := signer(1), signer(2), signer(3)
 	cr := testInstance()
 
 	// Pass 1: generation 2 is in use, generation 1 is marked retired, and
 	// its delete fails.
-	setTSAKeys(cr, ca, &two, nil, true, []tsaSigner{one})
+	setTSAKeys(cr, st, records, &two, nil, true, []tsaSigner{one})
 	// Pass 2: generation 3 is pending, so generation 2 and the undeleted
 	// generation 1 are listed from their Secrets.
-	setTSAKeys(cr, ca, &three, []tsaSigner{two, one}, false, nil)
+	setTSAKeys(cr, st, records, &three, []tsaSigner{two, one}, false, nil)
 
 	got := make([]string, 0, len(cr.Status.TSA.Signers))
 	for _, k := range cr.Status.TSA.Signers {
@@ -343,5 +384,79 @@ func TestSetTSAKeysListsEachGenerationOnce(t *testing.T) {
 	}
 	if want := []string{"3:Pending", "2:Active", "1:Active"}; !slices.Equal(got, want) {
 		t.Fatalf("signers %v, want %v", got, want)
+	}
+	if k := cr.Status.TSA.Signers[0]; k.IssuerSerialNumber != st.target.ca.Intermediate.SerialNumber.Text(16) {
+		t.Fatalf("signer issuer %s, want the intermediate", k.IssuerSerialNumber)
+	}
+}
+
+// Status lists each root before its intermediates, newest first, and a
+// root is retired only once every intermediate under it is.
+func TestCAStatus(t *testing.T) {
+	now := time.Now()
+	retired := now.Add(-time.Hour)
+	old := testCA(t, caGen{1, 1}, now, now, true)
+	mid := testCA(t, caGen{2, 1}, now, now, true)
+	newer, err := mid.roots[0].root.IssueIntermediate(pqcv1alpha1.MLDSA65, "test intermediate", pki.TSAIntermediateEKU, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []chainRecord{
+		{gen: caGen{2, 2}, chain: newer},
+		{gen: caGen{2, 1}, chain: mid.target.ca, retiredAt: &retired},
+		{gen: caGen{1, 1}, chain: old.target.ca, retiredAt: &retired},
+	}
+	describe := func(list []pqcv1alpha1.CAStatus) []string {
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			out = append(out, s.String())
+		}
+		return out
+	}
+	got := describe(caStatus(records, caGen{2, 2}, true))
+	want := []string{"Root 2-0 Active", "Intermediate 2-2 Pending", "Intermediate 2-1 Retired", "Root 1-0 Retired", "Intermediate 1-1 Retired"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("cas %v, want %v", got, want)
+	}
+	if got := describe(caStatus(records[:1], caGen{2, 2}, true)); !slices.Equal(got, []string{"Root 2-0 Pending", "Intermediate 2-2 Pending"}) {
+		t.Fatalf("cas %v: a root whose only intermediate is pending is pending", got)
+	}
+	list := caStatus(records, caGen{2, 2}, false)
+	if list[1].IssuerSerialNumber != list[0].SerialNumber || list[0].IssuerSerialNumber != "" || list[3].RetiredAt == nil {
+		t.Fatalf("cas %+v", list)
+	}
+}
+
+// The trusted root lists every chain, oldest first, without a leaf, and
+// gives a retired chain its validity end.
+func TestTrustedRoot(t *testing.T) {
+	now := time.Now()
+	retired := now.Add(-time.Hour).Truncate(time.Second)
+	a := testCA(t, caGen{1, 1}, now, now, true)
+	b := testCA(t, caGen{2, 1}, now, now, true)
+	raw, err := trustedRoot(testInstance(), []componentRecords{{tsaCA, []chainRecord{
+		{gen: caGen{2, 1}, chain: b.target.ca},
+		{gen: caGen{1, 1}, chain: a.target.ca, retiredAt: &retired},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tr prototrustroot.TrustedRoot
+	if err := protojson.Unmarshal(raw, &tr); err != nil {
+		t.Fatal(err)
+	}
+	tsas := tr.GetTimestampAuthorities()
+	if tr.GetMediaType() != trustedRootMediaType || len(tsas) != 2 {
+		t.Fatalf("trusted root %v", &tr)
+	}
+	first := tsas[0].GetCertChain().GetCertificates()
+	if len(first) != 2 || !bytes.Equal(first[0].GetRawBytes(), a.target.ca.Intermediate.Raw) || !bytes.Equal(first[1].GetRawBytes(), a.target.ca.Root.Raw) {
+		t.Fatal("first entry is not the old intermediate and root")
+	}
+	if end := tsas[0].GetValidFor().GetEnd(); end == nil || !end.AsTime().Equal(retired) {
+		t.Fatalf("retired entry ends %v, want %s", end, retired)
+	}
+	if tsas[1].GetValidFor().End != nil || tsas[1].GetUri() != "http://demo-tsa.ns.svc:3000/api/v1/timestamp" {
+		t.Fatalf("current entry %v", tsas[1])
 	}
 }

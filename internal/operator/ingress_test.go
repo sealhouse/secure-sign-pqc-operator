@@ -98,7 +98,7 @@ func TestIngressKubernetes(t *testing.T) {
 	})
 	markAvailable(t, ns)
 	eventually(t, 30*time.Second, "signer 1 retired", func() error {
-		if got, want := keySecrets(t, ns), []string{"demo-tsa-ca", "demo-tsa-signer-2"}; !slices.Equal(got, want) {
+		if got, want := keySecrets(t, ns), []string{"demo-tsa-intermediate-1-1", "demo-tsa-root-1", "demo-tsa-signer-1-1-2"}; !slices.Equal(got, want) {
 			return fmt.Errorf("key Secrets %v", got)
 		}
 		return nil

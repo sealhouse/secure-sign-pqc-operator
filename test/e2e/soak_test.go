@@ -4,17 +4,12 @@ package e2e
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
-	"math/big"
 	mrand "math/rand/v2"
 	"net/http"
 	"os"
@@ -26,8 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/digitorus/timestamp"
-	"github.com/sigstore/timestamp-authority/v2/pkg/verification"
 	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -42,7 +35,6 @@ import (
 	pqcv1alpha1 "github.com/sealhouse/secure-sign-pqc-operator/api/v1alpha1"
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/controller"
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/operator"
-	"github.com/sealhouse/secure-sign-pqc-operator/internal/pki"
 )
 
 // The soak kills the operator at random for SOAK_DURATION (default 1h)
@@ -516,39 +508,13 @@ func sigkill(ctx context.Context, pod string) error {
 }
 
 // verifiedTimestamp asks the instance's TSA for a timestamp and verifies it
-// against the instance's trust anchor.
+// against the instance's trusted root.
 func verifiedTimestamp(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC) error {
-	var ca corev1.Secret
-	caKey := client.ObjectKey{Namespace: cr.Namespace, Name: controller.TSACASecretName(cr.Name)}
-	if err := k8s.Get(ctx, caKey, &ca); err != nil {
-		return err
-	}
-	root, err := pemCertificate(ca.Data[pki.RootPEM])
+	s, err := stamp(ctx, cr)
 	if err != nil {
 		return err
 	}
-	intermediate, err := pemCertificate(ca.Data[pki.IntermediatePEM])
-	if err != nil {
-		return err
-	}
-	artifact := []byte("sealhouse soak " + time.Now().UTC().Format(time.RFC3339Nano))
-	nonce, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 63))
-	if err != nil {
-		return err
-	}
-	req, err := timestamp.CreateRequest(bytes.NewReader(artifact), &timestamp.RequestOptions{
-		Hash: crypto.SHA256, Certificates: true, Nonce: nonce,
-	})
-	if err != nil {
-		return err
-	}
-	tsr, err := requestTimestamp(ctx, controller.TSAName(cr.Name), req)
-	if err != nil {
-		return err
-	}
-	_, err = verification.VerifyTimestampResponse(tsr, bytes.NewReader(artifact), verification.VerifyOpts{
-		Roots: []*x509.Certificate{root}, Intermediates: []*x509.Certificate{intermediate}, Nonce: nonce,
-	})
+	_, _, err = verifyTrusted(ctx, cr, s)
 	return err
 }
 

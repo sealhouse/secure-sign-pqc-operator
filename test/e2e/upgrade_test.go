@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +54,8 @@ type upgrade struct {
 	readyAfter      bool
 	readyConditions []metav1.Condition
 	nonDefault      nonDefaultUpgrade
+	// before is a timestamp the instance issued on the previous head.
+	before *stamped
 }
 
 // nonDefaultUpgrade records the non-default instance across the upgrade.
@@ -84,22 +85,7 @@ func installUpgrade(ctx context.Context) error {
 	if err := catalogFor(ctx, published.CatalogImage); err != nil {
 		return err
 	}
-	og := &operatorsv1.OperatorGroup{Namespace: operatorNamespace, Name: operatorNamespace}
-	if err := createOrUpdate(ctx, og, func() { og.Spec = operatorsv1.OperatorGroupSpec{} }); err != nil {
-		return err
-	}
-	sub := &operatorsv1alpha1.Subscription{
-		Namespace: operatorNamespace, Name: packageName,
-		Spec: &operatorsv1alpha1.SubscriptionSpec{
-			CatalogSource:          catalogName,
-			CatalogSourceNamespace: catalogNamespace,
-			Package:                packageName,
-			Channel:                channel,
-			StartingCSV:            u.from,
-			InstallPlanApproval:    operatorsv1alpha1.ApprovalManual,
-		},
-	}
-	if err := k8s.Create(ctx, sub); err != nil {
+	if err := subscribe(ctx, u.from, operatorsv1alpha1.ApprovalManual); err != nil {
 		return err
 	}
 	if err := approve(ctx, u.from); err != nil {
@@ -125,6 +111,9 @@ func installUpgrade(ctx context.Context) error {
 	}
 	if len(u.keysBefore) < 2 {
 		return fmt.Errorf("instance on %s has key Secrets %v, want the CA and a signer", u.from, u.keysBefore)
+	}
+	if u.before, err = stamp(ctx, cr); err != nil {
+		return fmt.Errorf("timestamp on %s: %w", u.from, err)
 	}
 	nonDefault, err := createNonDefault(ctx, &u.nonDefault)
 	if err != nil {
@@ -230,7 +219,63 @@ func TestUpgrade(t *testing.T) {
 			u.handover.Round(time.Second), handoverLimit, leaseDuration)
 	}
 	cr := &pqcv1alpha1.SecureSignPQC{Namespace: u.instance.Namespace, Name: u.instance.Name}
+	rotateUpgraded(t, cr, u.before)
 	deleteInstance(t, cr)
+}
+
+// rotateUpgraded rotates the inherited instance's root and intermediate
+// CAs. The timestamp from the previous head, and one from each CA, verify
+// against the trusted root at the end.
+func rotateUpgraded(t *testing.T, cr *pqcv1alpha1.SecureSignPQC, before *stamped) {
+	t.Helper()
+	ctx := t.Context()
+	if err := k8s.Get(ctx, client.ObjectKeyFromObject(cr), cr); err != nil {
+		t.Fatal(err)
+	}
+	stamps := []*stamped{before}
+	take := func() {
+		t.Helper()
+		s, err := stamp(ctx, cr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stamps = append(stamps, s)
+	}
+	edit := func(f func(*pqcv1alpha1.SigningSpec)) {
+		t.Helper()
+		if err := editSigning(ctx, cr, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signing := cr.Spec.TSA.Signing
+	root, intermediate := signing.RootGeneration, signing.IntermediateGeneration
+	root++
+	edit(func(s *pqcv1alpha1.SigningSpec) { s.RootGeneration = root })
+	if err := waitTSAIntermediate(ctx, cr, root, intermediate); err != nil {
+		t.Fatal(err)
+	}
+	take()
+	intermediate++
+	edit(func(s *pqcv1alpha1.SigningSpec) { s.IntermediateGeneration = intermediate })
+	if err := waitTSAIntermediate(ctx, cr, root, intermediate); err != nil {
+		t.Fatal(err)
+	}
+	take()
+	for i, s := range stamps {
+		if _, _, err := verifyTrusted(ctx, cr, s); err != nil {
+			t.Errorf("timestamp %d: %v", i, err)
+		}
+	}
+}
+
+// waitTSAIntermediate waits until cr is Ready with no CA rotation in
+// progress and its active intermediate is root-intermediate.
+func waitTSAIntermediate(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, root, intermediate int32) error {
+	want := fmt.Sprintf("Intermediate %d-%d Active", root, intermediate)
+	if err := waitSettled(ctx, cr, nil, func(got []string) bool { return slices.Contains(got, want) }); err != nil {
+		return fmt.Errorf("waiting for %s: %w", want, err)
+	}
+	return nil
 }
 
 // TestUpgradeKeepsSigningSettings checks the instance created with

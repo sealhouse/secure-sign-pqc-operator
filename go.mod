@@ -7,9 +7,11 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/operator-framework/api v0.45.0
 	github.com/prometheus/client_golang v1.25.0
+	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/timestamp-authority/v2 v2.2.1-0.20261023073645-792c0729779e
 	go.uber.org/zap v1.28.0
 	golang.org/x/time v0.16.0
+	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.0
 	k8s.io/apiextensions-apiserver v0.37.0
 	k8s.io/apimachinery v0.37.0
@@ -119,7 +121,6 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1 // indirect
-	github.com/sigstore/protobuf-specs v0.5.2 // indirect
 	github.com/sigstore/sigstore v1.11.1 // indirect
 	github.com/sigstore/sigstore/pkg/signature/kms/aws v1.11.1 // indirect
 	github.com/sigstore/sigstore/pkg/signature/kms/azure v1.11.1 // indirect
@@ -162,7 +163,6 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/grpc v1.84.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	k8s.io/apiserver v0.37.0 // indirect

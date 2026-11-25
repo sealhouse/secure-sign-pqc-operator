@@ -139,18 +139,18 @@ func checkOneKeyPerRole(t *testing.T, ns string) {
 	if got := signerStatus(cr); got != "1:ML-DSA-65:Active" {
 		t.Fatalf("signers %s, want one active generation-1 key", got)
 	}
-	chain := decodeSigner(t, ns, 1)
+	chain := decodeSigner(t, ns, 1, 1, 1)
 	if got, want := cr.Status.TSA.Signers[0].SerialNumber, chain.Leaf.SerialNumber.Text(16); got != want {
 		t.Fatalf("status names signer %s, the Secret holds %s", got, want)
 	}
-	if cr.Status.TSA.CA == nil || cr.Status.TSA.CA.SerialNumber != chain.Intermediate.SerialNumber.Text(16) {
-		t.Fatalf("status CA %+v, the Secret holds %s", cr.Status.TSA.CA, chain.Intermediate.SerialNumber.Text(16))
+	if ca := activeIntermediate(cr); ca == nil || ca.SerialNumber != chain.Intermediate.SerialNumber.Text(16) {
+		t.Fatalf("status CA %+v, the Secret holds %s", ca, chain.Intermediate.SerialNumber.Text(16))
 	}
 	var d appsv1.Deployment
 	if err := k8s.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: controller.TSAName("demo")}, &d); err != nil {
 		t.Fatal(err)
 	}
-	if got := d.Spec.Template.Spec.Volumes[0].Secret.SecretName; got != controller.TSASignerSecretName("demo", 1) {
+	if got := d.Spec.Template.Spec.Volumes[0].Secret.SecretName; got != controller.TSASignerSecretName("demo", 1, 1, 1) {
 		t.Fatalf("pods mount %s", got)
 	}
 	if !conditionIsTrue(cr, pqcv1alpha1.ConditionReady) {

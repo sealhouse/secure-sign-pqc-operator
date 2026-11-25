@@ -11,10 +11,10 @@ import (
 	"strconv"
 	"time"
 
+	prototrustroot "github.com/sigstore/protobuf-specs/gen/pb-go/trustroot/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -40,27 +40,56 @@ const (
 
 // Labels on the TSA key Secrets.
 const (
-	LabelKeyRole       = "pqc.rhtas.redhat.com/key-role"
-	LabelKeyGeneration = "pqc.rhtas.redhat.com/key-generation"
-	RoleTSACA          = "tsa-ca"
-	RoleTSASigner      = "tsa-signer"
+	LabelKeyRole        = "pqc.rhtas.redhat.com/key-role"
+	LabelKeyGeneration  = "pqc.rhtas.redhat.com/key-generation"
+	RoleTSARoot         = "tsa-root"
+	RoleTSAIntermediate = "tsa-intermediate"
+	RoleTSAChain        = "tsa-chain"
+	RoleTSASigner       = "tsa-signer"
 )
 
 // maxRetiredSigners bounds the retired keys kept in status.
 const maxRetiredSigners = 16
 
-// TSACASecretName is the Secret holding an instance's TSA intermediate CA
-// key and certificates.
-func TSACASecretName(instance string) string { return instance + "-tsa-ca" }
+// TSARootSecretName is the Secret holding a TSA root CA key.
+func TSARootSecretName(instance string, root int32) string {
+	return tsaCA.rootSecretName(instance, root)
+}
 
-// TSASignerSecretName is the Secret holding an instance's TSA signing key
-// and chain for one signer generation.
-func TSASignerSecretName(instance string, generation int32) string {
-	return fmt.Sprintf("%s-tsa-signer-%d", instance, generation)
+// TSAIntermediateSecretName is the Secret holding a TSA intermediate CA key.
+func TSAIntermediateSecretName(instance string, root, intermediate int32) string {
+	return tsaCA.intermediateSecretName(instance, caGen{root, intermediate})
+}
+
+// TSAChainName is the ConfigMap recording a TSA intermediate's public chain.
+func TSAChainName(instance string, root, intermediate int32) string {
+	return tsaCA.chainName(instance, caGen{root, intermediate})
+}
+
+// TSASignerSecretName is the Secret holding a TSA signing key and chain,
+// for one signer generation under one intermediate.
+func TSASignerSecretName(instance string, root, intermediate, generation int32) string {
+	return fmt.Sprintf("%s-tsa-signer-%d-%d-%d", instance, root, intermediate, generation)
 }
 
 // TSAName is the name of the TSA Deployment and Service.
 func TSAName(instance string) string { return instance + "-tsa" }
+
+var tsaCA = caComponent{
+	name:              "tsa",
+	component:         "timestamp-authority",
+	title:             "TSA",
+	path:              tsaSigning,
+	eku:               pki.TSAIntermediateEKU,
+	roleRoot:          RoleTSARoot,
+	roleIntermediate:  RoleTSAIntermediate,
+	roleChain:         RoleTSAChain,
+	rotationCondition: pqcv1alpha1.ConditionTSACARotation,
+	authorities: func(tr *prototrustroot.TrustedRoot) *[]*prototrustroot.CertificateAuthority {
+		return &tr.TimestampAuthorities
+	},
+	url: func(cr *pqcv1alpha1.SecureSignPQC) string { return TSAURL(cr) + "/api/v1/timestamp" },
+}
 
 func tsaSelector(cr *pqcv1alpha1.SecureSignPQC) map[string]string {
 	return map[string]string{
@@ -77,173 +106,159 @@ func tsaLabels(cr *pqcv1alpha1.SecureSignPQC) map[string]string {
 	return l
 }
 
-func keySecretLabels(cr *pqcv1alpha1.SecureSignPQC, role string) map[string]string {
-	return map[string]string{
-		LabelName:      "tsa",
-		LabelInstance:  cr.Name,
-		LabelComponent: "timestamp-authority",
-		LabelManagedBy: ManagedBy,
-		LabelKeyRole:   role,
-	}
-}
-
 // ensureSecret returns the Secret key, creating it immutable with labels and
 // generate's data if it does not exist.
 func (r *SecureSignPQCReconciler) ensureSecret(ctx context.Context, key types.NamespacedName, labels map[string]string, generate func() (map[string][]byte, error)) (*corev1.Secret, error) {
-	var s corev1.Secret
-	err := r.APIReader.Get(ctx, key, &s)
-	if err == nil {
-		return &s, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return nil, err
-	}
-	data, err := generate()
-	if err != nil {
-		return nil, err
-	}
-	s = corev1.Secret{
-		Namespace: key.Namespace, Name: key.Name, Labels: labels,
-		Type:      corev1.SecretTypeOpaque,
-		Immutable: new(true),
-		Data:      data,
-	}
-	if err := r.Create(ctx, &s); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, err
-		}
-	} else {
-		logf.FromContext(ctx).Info("created key Secret", "secret", key.Name, "role", labels[LabelKeyRole])
-	}
-	// Read back what the API server holds, which is our Secret or one a
-	// concurrent writer created first.
-	if err := r.APIReader.Get(ctx, key, &s); err != nil {
-		return nil, err
-	}
-	return &s, nil
-}
-
-// ensureTSACA returns the instance's TSA CA, creating it with
-// spec.tsa.signing.algorithm if its Secret does not exist.
-func (r *SecureSignPQCReconciler) ensureTSACA(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC) (*pki.TSACA, error) {
-	key := types.NamespacedName{Namespace: cr.Namespace, Name: TSACASecretName(cr.Name)}
-	s, err := r.ensureSecret(ctx, key, keySecretLabels(cr, RoleTSACA), func() (map[string][]byte, error) {
-		ca, err := pki.NewTSACA(cr.Spec.TSA.Signing.Algorithm, fmt.Sprintf("%s/%s", cr.Namespace, cr.Name), time.Now())
+	s := &corev1.Secret{}
+	created, err := r.createIfAbsent(ctx, key, s, func() error {
+		data, err := generate()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return ca.Encode()
+		*s = corev1.Secret{
+			Namespace: key.Namespace, Name: key.Name, Labels: labels,
+			Type:      corev1.SecretTypeOpaque,
+			Immutable: new(true),
+			Data:      data,
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	ca, err := pki.DecodeTSACA(s.Data)
-	if err != nil {
-		return nil, &invalidSignerError{secret: key.Name, err: err}
+	if created {
+		logf.FromContext(ctx).Info("created key Secret", "secret", key.Name, "role", labels[LabelKeyRole])
 	}
-	return ca, nil
+	return s, nil
 }
 
-// tsaSigner is one generation's signer Secret, decoded.
+// createIfAbsent reads key into obj and, if there is no such object,
+// creates it as fill sets obj. obj ends as the API server holds it: the
+// object created, or one a concurrent writer created first.
+func (r *SecureSignPQCReconciler) createIfAbsent(ctx context.Context, key types.NamespacedName, obj client.Object, fill func() error) (bool, error) {
+	err := r.APIReader.Get(ctx, key, obj)
+	if err == nil {
+		return false, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return false, err
+	}
+	if err := fill(); err != nil {
+		return false, err
+	}
+	if err := r.Create(ctx, obj); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return false, err
+		}
+		return false, r.APIReader.Get(ctx, key, obj)
+	}
+	return true, nil
+}
+
+// tsaSigner is one signer Secret, decoded.
 type tsaSigner struct {
 	generation int32
+	ca         caGen
 	secret     *corev1.Secret
 	chain      *pki.TSAChain
 }
 
-// listTSASigners returns the instance's signer Secrets, read from the API
-// server, newest generation first.
-func (r *SecureSignPQCReconciler) listTSASigners(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC) ([]corev1.Secret, error) {
+// ensureTSASigner returns the signer for the current generation under the
+// target intermediate, issuing it if its Secret does not exist, and the
+// other signers, newest first.
+func (r *SecureSignPQCReconciler) ensureTSASigner(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, st *caState) (*tsaSigner, []tsaSigner, error) {
 	var list corev1.SecretList
 	if err := r.APIReader.List(ctx, &list, client.InNamespace(cr.Namespace),
 		client.MatchingLabels{LabelInstance: cr.Name, LabelKeyRole: RoleTSASigner}); err != nil {
-		return nil, err
-	}
-	for _, s := range list.Items {
-		if _, err := secretGeneration(&s); err != nil {
-			return nil, &invalidSignerError{secret: s.Name, err: err}
-		}
-	}
-	slices.SortFunc(list.Items, func(a, b corev1.Secret) int {
-		ga, _ := secretGeneration(&a)
-		gb, _ := secretGeneration(&b)
-		return cmp.Compare(gb, ga)
-	})
-	return list.Items, nil
-}
-
-func secretGeneration(s *corev1.Secret) (int32, error) {
-	g, err := strconv.ParseInt(s.Labels[LabelKeyGeneration], 10, 32)
-	if err != nil || g < 1 {
-		return 0, fmt.Errorf("label %s=%q is not a positive generation", LabelKeyGeneration, s.Labels[LabelKeyGeneration])
-	}
-	return int32(g), nil
-}
-
-// ensureTSASigner returns the signer for the current generation, issuing it
-// from ca if its Secret does not exist.
-func (r *SecureSignPQCReconciler) ensureTSASigner(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, ca *pki.TSACA) (*tsaSigner, []tsaSigner, error) {
-	existing, err := r.listTSASigners(ctx, cr)
-	if err != nil {
 		return nil, nil, err
 	}
-	gen := signerGeneration(cr.Spec.TSA.Signing)
-	var current *corev1.Secret
+	spec := cr.Spec.TSA.Signing
+	gen := signerGeneration(spec)
+	var current *tsaSigner
 	var older []tsaSigner
-	for i := range existing {
-		s := &existing[i]
-		g, _ := secretGeneration(s)
-		switch {
-		case g > gen:
+	for i := range list.Items {
+		s := &list.Items[i]
+		g, err := labelGeneration(s, LabelKeyGeneration)
+		if err != nil {
+			return nil, nil, invalidSecret(s.Name, err)
+		}
+		cg, err := labelCAGen(s)
+		if err != nil {
+			return nil, nil, invalidSecret(s.Name, err)
+		}
+		if g > gen {
 			// The instance was recreated below its last generation.
 			return nil, nil, &blockedError{
 				reason: "SignerGenerationBehind",
 				msg: fmt.Sprintf("signer Secret %s exists for generation %d; set %s.signerGeneration to %d or higher",
 					s.Name, g, tsaSigning, g),
 			}
-		case g == gen:
-			current = s
-		case g < gen:
-			chain, err := pki.DecodeTSAChain(s.Data, ca)
-			if err != nil {
-				return nil, nil, &invalidSignerError{secret: s.Name, err: err}
-			}
-			older = append(older, tsaSigner{generation: g, secret: s, chain: chain})
 		}
+		k := st.find(cg)
+		if k == nil {
+			return nil, nil, invalidSecret(s.Name, fmt.Errorf("issued by TSA intermediate %s, which has no CA Secret", cg))
+		}
+		chain, err := pki.DecodeTSAChain(s.Data, k.ca)
+		if err != nil {
+			return nil, nil, invalidSecret(s.Name, err)
+		}
+		signer := tsaSigner{generation: g, ca: cg, secret: s, chain: chain}
+		if g == gen && cg == st.target.gen {
+			current = &signer
+		} else {
+			older = append(older, signer)
+		}
+	}
+	slices.SortFunc(older, func(a, b tsaSigner) int {
+		if c := cmp.Compare(b.generation, a.generation); c != 0 {
+			return c
+		}
+		return b.ca.compare(a.ca)
+	})
+	if current != nil {
+		return current, older, nil
 	}
 
-	if current == nil {
-		if len(older) > 0 {
-			inUse, err := pki.AlgorithmOf(older[0].chain.Leaf.PublicKey)
-			if err != nil {
-				return nil, nil, err
+	if len(older) > 0 {
+		target := st.target.gen
+		accepted := func(a *pqcv1alpha1.WeakerAlgorithmAcceptance) bool {
+			switch {
+			case a.SignerGeneration == gen:
+				return true
+			case st.rootRotation():
+				return a.RootGeneration == target.root
+			case st.rotating():
+				return a.IntermediateGeneration == target.intermediate
 			}
-			if err := checkWeaker(cr.Spec.TSA.Signing, tsaSigning, inUse); err != nil {
-				return nil, nil, err
-			}
+			return false
 		}
-		key := types.NamespacedName{Namespace: cr.Namespace, Name: TSASignerSecretName(cr.Name, gen)}
-		labels := keySecretLabels(cr, RoleTSASigner)
-		labels[LabelKeyGeneration] = strconv.Itoa(int(gen))
-		current, err = r.ensureSecret(ctx, key, labels, func() (map[string][]byte, error) {
-			chain, err := ca.IssueLeaf(cr.Spec.TSA.Signing.Algorithm, fmt.Sprintf("%s/%s generation %d", cr.Namespace, cr.Name, gen), time.Now())
-			if err != nil {
-				return nil, err
-			}
-			return chain.Encode()
-		})
-		if err != nil {
+		hint := fmt.Sprintf("signerGeneration: %d", gen)
+		if err := weakerRefused(spec, tsaSigning, fmt.Sprintf("signer generation %d", gen), older[0].chain.Leaf, accepted, hint); err != nil {
 			return nil, nil, err
 		}
-		if g, err := secretGeneration(current); err != nil || g != gen {
-			return nil, nil, &invalidSignerError{secret: current.Name, err: fmt.Errorf("generation label does not match generation %d", gen)}
+	}
+	target := st.target
+	key := types.NamespacedName{Namespace: cr.Namespace, Name: TSASignerSecretName(cr.Name, target.gen.root, target.gen.intermediate, gen)}
+	labels := tsaCA.genLabels(cr, RoleTSASigner, target.gen)
+	labels[LabelKeyGeneration] = strconv.Itoa(int(gen))
+	s, err := r.ensureSecret(ctx, key, labels, func() (map[string][]byte, error) {
+		chain, err := target.ca.IssueLeaf(spec.Algorithm, fmt.Sprintf("%s/%s generation %d", cr.Namespace, cr.Name, gen), time.Now())
+		if err != nil {
+			return nil, err
 		}
-	}
-	chain, err := pki.DecodeTSAChain(current.Data, ca)
+		return chain.Encode()
+	})
 	if err != nil {
-		return nil, nil, &invalidSignerError{secret: current.Name, err: err}
+		return nil, nil, err
 	}
-	return &tsaSigner{generation: gen, secret: current, chain: chain}, older, nil
+	if g, err := labelGeneration(s, LabelKeyGeneration); err != nil || g != gen {
+		return nil, nil, invalidSecret(s.Name, fmt.Errorf("generation label does not match generation %d", gen))
+	}
+	chain, err := pki.DecodeTSAChain(s.Data, target.ca)
+	if err != nil {
+		return nil, nil, invalidSecret(s.Name, err)
+	}
+	return &tsaSigner{generation: gen, ca: target.gen, secret: s, chain: chain}, older, nil
 }
 
 // blockedError is a spec the operator will not act on until a person
@@ -254,14 +269,19 @@ type blockedError struct {
 
 func (e *blockedError) Error() string { return e.msg }
 
-// invalidSignerError is a key Secret the operator will not use.
+// invalidSignerError is a key Secret or chain record the operator will not
+// use.
 type invalidSignerError struct {
-	secret string
+	object string
 	err    error
 }
 
 func (e *invalidSignerError) Error() string {
-	return fmt.Sprintf("secret %s: %v", e.secret, e.err)
+	return fmt.Sprintf("%s: %v", e.object, e.err)
+}
+
+func invalidSecret(name string, err error) error {
+	return &invalidSignerError{object: "secret " + name, err: err}
 }
 
 func (e *invalidSignerError) Unwrap() error { return e.err }
@@ -378,18 +398,27 @@ func (r *SecureSignPQCReconciler) reconcileTSA(ctx context.Context, cr *pqcv1alp
 	if err != nil {
 		return rollout{}, err
 	}
-	ca, err := r.ensureTSACA(ctx, cr)
+	st, err := r.ensureCA(ctx, cr, tsaCA, cr.Spec.TSA.Signing)
 	if err != nil {
 		return rollout{}, err
 	}
-	current, older, err := r.ensureTSASigner(ctx, cr, ca)
+	current, older, err := r.ensureTSASigner(ctx, cr, st)
 	if err != nil {
+		return rollout{}, err
+	}
+	records, err := r.ensureChainRecords(ctx, cr, tsaCA, st)
+	if err != nil {
+		return rollout{}, err
+	}
+	if err := r.publishTrustedRoot(ctx, cr, []componentRecords{{tsaCA, records}}, tsaCA, st.target.ca); err != nil {
 		return rollout{}, err
 	}
 	if err := r.Apply(ctx, tsaService(cr), client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
 		return rollout{}, err
 	}
-	r.checkExpiry(cr, ca, current, older, time.Now())
+	now := time.Now()
+	soon := now.Add(r.Settings.Load().ExpiryWarning)
+	r.checkExpiry(cr, tsaExpiryChecks(st, current, older, soon), soon)
 	hash := signerHash(current.secret.Data)
 	d, err := tsaDeployment(cr, image, current.secret.Name, current.secret.Data, fips)
 	if err != nil {
@@ -415,13 +444,22 @@ func (r *SecureSignPQCReconciler) reconcileTSA(ctx context.Context, cr *pqcv1alp
 	if live.Spec.Template.Annotations[TSASignerHashAnnotation] != hash {
 		ro.available = false
 	}
+	r.setRotation(cr, tsaCA, st)
 
-	if !ro.available || len(older) == 0 {
-		setTSAKeys(cr, ca, current, older, ro.available, nil)
+	if !ro.available || (len(older) == 0 && !st.rotating()) {
+		setTSAKeys(cr, st, records, current, older, ro.available, nil)
 		return ro, nil
 	}
+	// Every pod uses the current signer: retire the rest. The CA records
+	// are marked first and status is written before any key is deleted.
+	if err := r.markCAsRetired(ctx, cr, tsaCA, st, now); err != nil {
+		return rollout{}, err
+	}
+	if records, err = r.ensureChainRecords(ctx, cr, tsaCA, st); err != nil {
+		return rollout{}, err
+	}
 	base := cr.DeepCopy()
-	setTSAKeys(cr, ca, current, nil, true, older)
+	setTSAKeys(cr, st, records, current, nil, true, older)
 	if err := r.applyStatus(ctx, base, cr); err != nil {
 		return rollout{}, err
 	}
@@ -430,8 +468,15 @@ func (r *SecureSignPQCReconciler) reconcileTSA(ctx context.Context, cr *pqcv1alp
 		if err != nil && !apierrors.IsNotFound(err) {
 			return rollout{}, err
 		}
-		logf.FromContext(ctx).Info("retired TSA signer", "secret", s.secret.Name, "generation", s.generation)
+		logf.FromContext(ctx).Info("retired TSA signer", "secret", s.secret.Name, "generation", s.generation, "ca", s.ca.String())
 	}
+	if err := r.retireCAs(ctx, tsaCA, st); err != nil {
+		return rollout{}, err
+	}
+	if err := r.publishTrustedRoot(ctx, cr, []componentRecords{{tsaCA, records}}, tsaCA, st.target.ca); err != nil {
+		return rollout{}, err
+	}
+	r.setRotation(cr, tsaCA, st)
 	return ro, nil
 }
 
@@ -451,81 +496,56 @@ func fipsMode(cr *pqcv1alpha1.SecureSignPQC) (string, error) {
 	}
 }
 
-// checkExpiry sets the CertificatesExpiring condition from the signers in
-// use and their CA, recording an event when it turns True.
-func (r *SecureSignPQCReconciler) checkExpiry(cr *pqcv1alpha1.SecureSignPQC, ca *pki.TSACA, current *tsaSigner, older []tsaSigner, now time.Time) {
-	type checked struct {
-		what   string
-		cert   *x509.Certificate
-		signer bool
+// tsaExpiryChecks are the TSA's CAs and signers in use. soon is the end of
+// the expiry warning window.
+func tsaExpiryChecks(st *caState, current *tsaSigner, older []tsaSigner, soon time.Time) []expiryCheck {
+	checks, fixes := caExpiryChecks(tsaCA, st)
+	// The CAs come first, so a signer that expires with them names the CA.
+	// A signer cannot outlive its intermediate, so a new one helps only if
+	// the intermediate has time left.
+	cur := expiryCheck{fix: fmt.Sprintf("raise %s.signerGeneration to issue a new one", tsaSigning)}
+	if !st.target.ca.Intermediate.NotAfter.After(soon) {
+		cur = fixes.intermediate
 	}
-	// The CA comes first, so a signer that expires with it names the CA.
-	certs := make([]checked, 0, 3+len(older))
-	certs = append(certs,
-		checked{"intermediate CA", ca.Intermediate, false},
-		checked{"root CA", ca.Root, false},
-		checked{fmt.Sprintf("signer generation %d", current.generation), current.chain.Leaf, true})
+	cur.what, cur.cert, cur.signer = fmt.Sprintf("TSA signer generation %d", current.generation), current.chain.Leaf, true
+	checks = append(checks, cur)
 	for _, s := range older {
-		certs = append(certs, checked{fmt.Sprintf("signer generation %d (in use until generation %d rolls out)", s.generation, current.generation), s.chain.Leaf, true})
+		checks = append(checks, expiryCheck{
+			what: fmt.Sprintf("TSA signer generation %d of intermediate %s (in use until generation %d rolls out)", s.generation, s.ca, current.generation),
+			cert: s.chain.Leaf, fix: finishRollout, signer: true,
+		})
 	}
-	soonest := certs[0]
-	for _, c := range certs[1:] {
-		if c.cert.NotAfter.Before(soonest.cert.NotAfter) {
-			soonest = c
-		}
-	}
-	warning := r.Settings.Load().ExpiryWarning
-	c := metav1.Condition{Type: pqcv1alpha1.ConditionCertificatesExpiring}
-	expires := soonest.cert.NotAfter.UTC().Format(time.RFC3339)
-	switch {
-	case soonest.cert.NotAfter.After(now.Add(warning)):
-		c.Status, c.Reason = metav1.ConditionFalse, "NotExpiring"
-		c.Message = fmt.Sprintf("TSA %s certificate expires first, at %s", soonest.what, expires)
-	case soonest.signer && soonest.cert != current.chain.Leaf && current.chain.Leaf.NotAfter.After(now.Add(warning)):
-		c.Status, c.Reason = metav1.ConditionTrue, "SignerExpiring"
-		c.Message = fmt.Sprintf("TSA %s certificate expires at %s; finish that rollout", soonest.what, expires)
-	case soonest.signer:
-		c.Status, c.Reason = metav1.ConditionTrue, "SignerExpiring"
-		c.Message = fmt.Sprintf("TSA %s certificate expires at %s; raise %s.signerGeneration to issue a new one", soonest.what, expires, tsaSigning)
-	default:
-		c.Status, c.Reason = metav1.ConditionTrue, "CAExpiring"
-		c.Message = fmt.Sprintf("TSA %s certificate expires at %s; a new signer cannot outlive it, and CA rotation is not supported yet", soonest.what, expires)
-	}
-	if c.Status == metav1.ConditionTrue && !meta.IsStatusConditionTrue(cr.Status.Conditions, c.Type) && r.Recorder != nil {
-		r.Recorder.Eventf(cr, nil, corev1.EventTypeWarning, c.Reason, "CheckExpiry", "%s", c.Message)
-	}
-	setCondition(cr, c)
+	return checks
 }
 
-// setTSAKeys records the CA and signers in status.
-func setTSAKeys(cr *pqcv1alpha1.SecureSignPQC, ca *pki.TSACA, current *tsaSigner, older []tsaSigner, currentInUse bool, retiring []tsaSigner) {
-	caStatus := keyStatus(ca.Intermediate, 0, pqcv1alpha1.KeyActive)
-	cr.Status.TSA.CA = &caStatus
+// setTSAKeys records the CAs and signers in status.
+func setTSAKeys(cr *pqcv1alpha1.SecureSignPQC, st *caState, records []chainRecord, current *tsaSigner, older []tsaSigner, currentInUse bool, retiring []tsaSigner) {
+	cr.Status.TSA.CAs = caStatus(records, st.target.gen, st.rotating() && !currentInUse)
 
 	stage := pqcv1alpha1.KeyPending
 	if currentInUse {
 		stage = pqcv1alpha1.KeyActive
 	}
-	signers := []pqcv1alpha1.KeyStatus{keyStatus(current.chain.Leaf, current.generation, stage)}
-	for _, s := range older {
-		signers = append(signers, keyStatus(s.chain.Leaf, s.generation, pqcv1alpha1.KeyActive))
+	signers := []pqcv1alpha1.KeyStatus{signerStatus(current, stage)}
+	for i := range older {
+		signers = append(signers, signerStatus(&older[i], pqcv1alpha1.KeyActive))
 	}
 	now := metav1.Now()
 	var retired []pqcv1alpha1.KeyStatus
-	for _, s := range retiring {
-		k := keyStatus(s.chain.Leaf, s.generation, pqcv1alpha1.KeyRetired)
+	for i := range retiring {
+		k := signerStatus(&retiring[i], pqcv1alpha1.KeyRetired)
 		k.RetiredAt = &now
 		retired = append(retired, k)
 	}
-	// Carry retired entries forward, except for a generation listed above:
-	// a key marked retired whose delete failed still has its Secret, and
-	// is reported from that until it is gone.
-	listed := func(g int32) bool {
-		return slices.ContainsFunc(signers, func(k pqcv1alpha1.KeyStatus) bool { return k.Generation == g }) ||
-			slices.ContainsFunc(retired, func(k pqcv1alpha1.KeyStatus) bool { return k.Generation == g })
+	// Carry retired entries forward, except for a key listed above: a key
+	// marked retired whose delete failed still has its Secret, and is
+	// reported from that until it is gone.
+	listed := func(serial string) bool {
+		same := func(k pqcv1alpha1.KeyStatus) bool { return k.SerialNumber == serial }
+		return slices.ContainsFunc(signers, same) || slices.ContainsFunc(retired, same)
 	}
 	for _, k := range cr.Status.TSA.Signers {
-		if k.Stage == pqcv1alpha1.KeyRetired && !listed(k.Generation) {
+		if k.Stage == pqcv1alpha1.KeyRetired && !listed(k.SerialNumber) {
 			retired = append(retired, k)
 		}
 	}
@@ -536,14 +556,26 @@ func setTSAKeys(cr *pqcv1alpha1.SecureSignPQC, ca *pki.TSACA, current *tsaSigner
 	cr.Status.TSA.Signers = append(signers, retired...)
 }
 
-func keyStatus(cert *x509.Certificate, generation int32, stage pqcv1alpha1.KeyStage) pqcv1alpha1.KeyStatus {
-	a, _ := pki.AlgorithmOf(cert.PublicKey)
+func signerStatus(s *tsaSigner, stage pqcv1alpha1.KeyStage) pqcv1alpha1.KeyStatus {
 	return pqcv1alpha1.KeyStatus{
-		Generation:   generation,
+		Generation:        s.generation,
+		CertificateStatus: certificateStatus(s.chain.Leaf, s.chain.Intermediate, stage),
+	}
+}
+
+// certificateStatus describes cert at stage, issued by issuer, which is nil
+// for a root.
+func certificateStatus(cert, issuer *x509.Certificate, stage pqcv1alpha1.KeyStage) pqcv1alpha1.CertificateStatus {
+	a, _ := pki.AlgorithmOf(cert.PublicKey)
+	s := pqcv1alpha1.CertificateStatus{
 		Algorithm:    a,
 		SerialNumber: cert.SerialNumber.Text(16),
 		NotBefore:    metav1.NewTime(cert.NotBefore),
 		NotAfter:     metav1.NewTime(cert.NotAfter),
 		Stage:        stage,
 	}
+	if issuer != nil {
+		s.IssuerSerialNumber = issuer.SerialNumber.Text(16)
+	}
+	return s
 }
