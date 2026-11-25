@@ -35,9 +35,11 @@ crane_args=()
 case "${registry}" in localhost:*) crane_args=(--insecure) ;; esac
 digest_ref() { echo "${registry}/sealhouse/$1@$(crane digest "${crane_args[@]}" "${registry}/sealhouse/$1:$2")"; }
 
-# The recorded alpha head, in merge mode.
+# The recorded alpha head, in merge mode, which this bundle replaces unless
+# the upgrade boundary lies between them.
 prev_csv=""
 prev_fbc=""
+base_csv=""
 if [ -n "${catalog_repo}" ]; then
   head_env="${catalog_repo}/${channel}/head.env"
   if [ -f "${head_env}" ]; then
@@ -62,6 +64,15 @@ if [ -n "${catalog_repo}" ]; then
         { echo "bundle ${img} from the alpha history is missing from ${registry}" >&2; exit 1; }
     done
     echo "alpha head ${prev_csv} (operator ${prev_commit:0:12})" >&2
+    base_csv="${prev_csv}"
+    # A head built before the last change to the upgrade boundary cannot be
+    # upgraded from: start a new upgrade graph, as for the first alpha.
+    boundary="$(git -C "${repo}" log -1 --format=%H -- .sealhouse/upgrade-boundary)"
+    if [ -n "${boundary}" ] && ! git -C "${repo}" merge-base --is-ancestor "${boundary}" "${prev_commit}"; then
+      echo "alpha head ${prev_csv} predates the upgrade boundary ${boundary:0:12} ($(head -1 "${repo}/.sealhouse/upgrade-boundary")): starting a new upgrade graph" >&2
+      prev_csv=""
+      prev_fbc=""
+    fi
   else
     echo "no alpha head in ${catalog_repo}: this is the first alpha" >&2
   fi
@@ -117,6 +128,7 @@ BUNDLE_IMAGE=${bundle_image}
 CATALOG_IMAGE=${catalog_image}
 CSV=${csv}
 PREVIOUS_CSV=${prev_csv}
+BASE_CSV=${base_csv}
 OPERATOR_COMMIT=${commit}
 ENV
 cat "${dist}/alpha.env"

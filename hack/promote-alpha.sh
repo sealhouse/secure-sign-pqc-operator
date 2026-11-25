@@ -33,7 +33,7 @@ published="$(crane digest "${crane_args[@]}" "${registry}/sealhouse/pqc-catalog:
 
 mkdir -p "${catalog_repo}/${channel}"
 cp "${fbc}" "${catalog_repo}/${channel}/catalog.json"
-grep -E '^(OPERATOR_IMAGE|BUNDLE_IMAGE|CATALOG_IMAGE|CSV|PREVIOUS_CSV|OPERATOR_COMMIT)=' "${env_file}" \
+grep -E '^(OPERATOR_IMAGE|BUNDLE_IMAGE|CATALOG_IMAGE|CSV|PREVIOUS_CSV|BASE_CSV|OPERATOR_COMMIT)=' "${env_file}" \
   >"${catalog_repo}/${channel}/head.env"
 git -C "${catalog_repo}" add "${channel}"
 git -C "${catalog_repo}" commit -q -m "${channel}: ${csv}"

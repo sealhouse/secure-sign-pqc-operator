@@ -225,25 +225,30 @@ func install(ctx context.Context) error {
 		return err
 	}
 
+	if err := subscribe(ctx, published.CSV, operatorsv1alpha1.ApprovalAutomatic); err != nil {
+		return err
+	}
+	return waitInstalled(ctx, published.CSV)
+}
+
+// subscribe subscribes the operator namespace to our package from csv,
+// with an OperatorGroup for it.
+func subscribe(ctx context.Context, csv string, approval operatorsv1alpha1.Approval) error {
 	og := &operatorsv1.OperatorGroup{Namespace: operatorNamespace, Name: operatorNamespace}
 	if err := createOrUpdate(ctx, og, func() { og.Spec = operatorsv1.OperatorGroupSpec{} }); err != nil {
 		return err
 	}
-	sub := &operatorsv1alpha1.Subscription{
+	return k8s.Create(ctx, &operatorsv1alpha1.Subscription{
 		Namespace: operatorNamespace, Name: packageName,
 		Spec: &operatorsv1alpha1.SubscriptionSpec{
 			CatalogSource:          catalogName,
 			CatalogSourceNamespace: catalogNamespace,
 			Package:                packageName,
 			Channel:                channel,
-			StartingCSV:            published.CSV,
-			InstallPlanApproval:    operatorsv1alpha1.ApprovalAutomatic,
+			StartingCSV:            csv,
+			InstallPlanApproval:    approval,
 		},
-	}
-	if err := k8s.Create(ctx, sub); err != nil {
-		return err
-	}
-	return waitInstalled(ctx, published.CSV)
+	})
 }
 
 // servesCSV reports whether the package manifest from our catalog has the

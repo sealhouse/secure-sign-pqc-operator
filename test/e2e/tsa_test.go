@@ -5,17 +5,13 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
 	"crypto/x509"
-	"encoding/pem"
-	"errors"
 	"fmt"
-	"math/big"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/digitorus/timestamp"
 	"github.com/sigstore/timestamp-authority/v2/pkg/verification"
 	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -25,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pqcv1alpha1 "github.com/sealhouse/secure-sign-pqc-operator/api/v1alpha1"
@@ -131,13 +128,7 @@ func TestTimestamp(t *testing.T) {
 	}
 	t.Cleanup(func() { deleteInstance(t, cr) })
 
-	if err := poll(ctx, 5*time.Minute, func() (bool, error) {
-		if err := k8s.Get(ctx, client.ObjectKeyFromObject(cr), cr); err != nil {
-			return false, err
-		}
-		return cr.Status.ObservedGeneration == cr.Generation &&
-			meta.IsStatusConditionTrue(cr.Status.Conditions, pqcv1alpha1.ConditionReady), nil
-	}); err != nil {
+	if err := waitReady(ctx, cr); err != nil {
 		t.Fatalf("instance not Ready: %v; conditions %+v", err, cr.Status.Conditions)
 	}
 	t.Logf("instance Ready %s after creation", time.Since(created).Round(time.Second))
@@ -155,53 +146,20 @@ func TestTimestamp(t *testing.T) {
 		assertUID(t, p, uid)
 	}
 
-	var ca corev1.Secret
-	caKey := client.ObjectKey{Namespace: namespace, Name: controller.TSACASecretName(cr.Name)}
-	if err := k8s.Get(ctx, caKey, &ca); err != nil {
-		t.Fatal(err)
-	}
-	root, err := pemCertificate(ca.Data[pki.RootPEM])
-	if err != nil {
-		t.Fatal(err)
-	}
-	intermediate, err := pemCertificate(ca.Data[pki.IntermediatePEM])
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	artifact := []byte("sealhouse e2e " + time.Now().UTC().Format(time.RFC3339Nano))
-	nonce, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 63))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := timestamp.CreateRequest(bytes.NewReader(artifact), &timestamp.RequestOptions{
-		Hash: crypto.SHA256, Certificates: true, Nonce: nonce,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tsr, err := requestTimestamp(ctx, controller.TSAName(cr.Name), req)
+	s, err := stamp(ctx, cr)
 	if err != nil {
 		logPods(t, ctx, namespace, d.Spec.Selector.MatchLabels)
 		t.Fatal(err)
 	}
-
-	ts, err := verification.VerifyTimestampResponse(tsr, bytes.NewReader(artifact), verification.VerifyOpts{
-		Roots: []*x509.Certificate{root}, Intermediates: []*x509.Certificate{intermediate}, Nonce: nonce,
-	})
+	ts, intermediate, err := verifyTrusted(ctx, cr, s)
 	if err != nil {
-		t.Fatalf("verify against the instance root: %v", err)
+		t.Fatalf("verify against the instance's trusted root: %v", err)
 	}
 	// The signing certificate is the active signer's, with the instance's
 	// algorithm.
-	var leaf *x509.Certificate
-	for _, c := range ts.Certificates {
-		if !c.IsCA {
-			leaf = c
-		}
-	}
-	if leaf == nil {
-		t.Fatal("response carries no signing certificate")
+	leaf, err := signingCert(ts)
+	if err != nil {
+		t.Fatal(err)
 	}
 	got, err := pki.AlgorithmOf(leaf.PublicKey)
 	if err != nil {
@@ -224,15 +182,156 @@ func TestTimestamp(t *testing.T) {
 	}
 
 	// The same response does not verify against another trust anchor.
-	foreign, err := pki.NewTSACA(algorithm, "foreign", time.Now())
+	foreign, err := pki.NewRoot(algorithm, "foreign", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verification.VerifyTimestampResponse(tsr, bytes.NewReader(artifact), verification.VerifyOpts{
-		Roots: []*x509.Certificate{foreign.Root}, Intermediates: []*x509.Certificate{intermediate}, Nonce: nonce,
+	if _, err := verification.VerifyTimestampResponse(s.tsr, bytes.NewReader(s.artifact), verification.VerifyOpts{
+		Roots: []*x509.Certificate{foreign.Cert}, Intermediates: []*x509.Certificate{intermediate}, Nonce: s.nonce,
 	}); err == nil {
 		t.Error("response verified against a foreign root")
 	}
+}
+
+// TestCARotation rotates an instance's intermediate and then its root,
+// timestamping during each rollout. Timestamps from before and after each
+// rotation verify against the trusted root, new ones chain to the new
+// CA, and the old CA keys are deleted.
+func TestCARotation(t *testing.T) {
+	ctx := t.Context()
+	cr := &pqcv1alpha1.SecureSignPQC{
+		Namespace: namespace, Name: "e2e-rotate",
+		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0"},
+	}
+	deleteInstance(t, cr)
+	if err := k8s.Create(ctx, cr); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { deleteInstance(t, cr) })
+	if err := waitRotated(ctx, cr, nil, "Root 1-0 Active", "Intermediate 1-1 Active"); err != nil {
+		t.Fatal(err)
+	}
+	stamps := []*stamped{}
+	take := func() *stamped {
+		t.Helper()
+		s, err := stamp(ctx, cr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stamps = append(stamps, s)
+		return s
+	}
+	issuer := func(s *stamped) *x509.Certificate {
+		t.Helper()
+		_, intermediate, err := verifyTrusted(ctx, cr, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return intermediate
+	}
+	first := issuer(take())
+
+	edit := func(f func(*pqcv1alpha1.SigningSpec)) {
+		t.Helper()
+		if err := editSigning(ctx, cr, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Timestamps issued while the pods move must verify too, the old
+	// pods' included.
+	during := func() error {
+		s, err := stamp(ctx, cr)
+		if err == nil {
+			stamps = append(stamps, s)
+		}
+		return err
+	}
+
+	edit(func(s *pqcv1alpha1.SigningSpec) { s.IntermediateGeneration = 2 })
+	if err := waitRotated(ctx, cr, during,
+		"Root 1-0 Active", "Intermediate 1-2 Active", "Intermediate 1-1 Retired"); err != nil {
+		t.Fatal(err)
+	}
+	second := issuer(take())
+	if second.Equal(first) || !bytes.Equal(second.RawIssuer, first.RawIssuer) {
+		t.Fatalf("after the intermediate rotation timestamps chain to %s under %s", second.Subject, second.Issuer)
+	}
+
+	edit(func(s *pqcv1alpha1.SigningSpec) { s.RootGeneration = 2 })
+	if err := waitRotated(ctx, cr, during,
+		"Root 2-0 Active", "Intermediate 2-2 Active",
+		"Root 1-0 Retired", "Intermediate 1-2 Retired", "Intermediate 1-1 Retired"); err != nil {
+		t.Fatal(err)
+	}
+	third := issuer(take())
+	if bytes.Equal(third.RawIssuer, first.RawIssuer) {
+		t.Fatal("after the root rotation timestamps still chain to the old root")
+	}
+	for i, s := range stamps {
+		if _, _, err := verifyTrusted(ctx, cr, s); err != nil {
+			t.Errorf("timestamp %d: %v", i, err)
+		}
+	}
+	keys, err := keySecrets(ctx, client.ObjectKeyFromObject(cr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		controller.TSAIntermediateSecretName(cr.Name, 2, 2),
+		controller.TSARootSecretName(cr.Name, 2),
+		controller.TSASignerSecretName(cr.Name, 2, 2, 1),
+	}
+	if got := slices.Sorted(maps.Keys(keys)); !slices.Equal(got, want) {
+		t.Fatalf("key Secrets %v, want %v", got, want)
+	}
+}
+
+// editSigning changes cr's spec.tsa.signing, retrying on a conflict with
+// the operator's status writes.
+func editSigning(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, f func(*pqcv1alpha1.SigningSpec)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8s.Get(ctx, client.ObjectKeyFromObject(cr), cr); err != nil {
+			return err
+		}
+		f(&cr.Spec.TSA.Signing)
+		return k8s.Update(ctx, cr)
+	})
+}
+
+// waitRotated waits until cr has rolled out its spec with no CA rotation
+// in progress and status.tsa.cas reads want, calling during, if set, on
+// each poll and failing on its first error.
+func waitRotated(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, during func() error, want ...string) error {
+	return waitSettled(ctx, cr, during, func(got []string) bool { return slices.Equal(got, want) })
+}
+
+// waitSettled waits until cr has rolled out its spec with no CA rotation
+// in progress and match accepts its caStages, calling during as
+// waitRotated does.
+func waitSettled(
+	ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, during func() error, match func([]string) bool,
+) error {
+	var last string
+	err := poll(ctx, 5*time.Minute, func() (bool, error) {
+		if during != nil {
+			if err := during(); err != nil {
+				return false, fmt.Errorf("during the rollout: %w", err)
+			}
+		}
+		if err := k8s.Get(ctx, client.ObjectKeyFromObject(cr), cr); err != nil {
+			return false, err
+		}
+		got := caStages(cr)
+		last = fmt.Sprintf("cas %v, conditions %+v", got, cr.Status.Conditions)
+		return cr.Status.ObservedGeneration == cr.Generation &&
+			meta.IsStatusConditionTrue(cr.Status.Conditions, pqcv1alpha1.ConditionReady) &&
+			meta.IsStatusConditionFalse(cr.Status.Conditions, pqcv1alpha1.ConditionTSACARotation) &&
+			match(got), nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w; last %s", err, last)
+	}
+	return nil
 }
 
 // checkIngress checks the TSA Ingress and, on OpenShift, that the router
@@ -296,9 +395,9 @@ func checkIngress(t *testing.T, ctx context.Context, cr *pqcv1alpha1.SecureSignP
 
 // requestTimestamp posts an RFC 3161 request to the TSA Service through the
 // API server's service proxy.
-func requestTimestamp(ctx context.Context, service string, req []byte) ([]byte, error) {
+func requestTimestamp(ctx context.Context, ns, service string, req []byte) ([]byte, error) {
 	res := clientset.CoreV1().RESTClient().Post().
-		Namespace(namespace).Resource("services").Name(fmt.Sprintf("%s:%d", service, 3000)).
+		Namespace(ns).Resource("services").Name(fmt.Sprintf("%s:%d", service, 3000)).
 		SubResource("proxy").Suffix("api/v1/timestamp").
 		SetHeader("Content-Type", "application/timestamp-query").
 		SetHeader("Accept", "application/timestamp-reply").
@@ -328,6 +427,15 @@ func deleteInstance(t *testing.T, cr *pqcv1alpha1.SecureSignPQC) {
 		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 	}); err != nil {
 		t.Fatalf("instance %s not deleted: %v", cr.Name, err)
+	}
+	// Keys and chain records outlive their instance on purpose; a test
+	// that recreates the instance starts from none.
+	for _, obj := range []client.Object{&corev1.Secret{}, &corev1.ConfigMap{}} {
+		if err := k8s.DeleteAllOf(ctx, obj, client.InNamespace(cr.Namespace),
+			client.MatchingLabels{controller.LabelInstance: cr.Name, controller.LabelManagedBy: controller.ManagedBy},
+			client.HasLabels{controller.LabelKeyRole}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -399,12 +507,4 @@ func assertUID(t *testing.T, p corev1.Pod, uid int64) {
 	if scc := p.Annotations["openshift.io/scc"]; openshift && scc != sccRestricted {
 		t.Errorf("pod %s/%s admitted under SCC %q, not %s", p.Namespace, p.Name, scc, sccRestricted)
 	}
-}
-
-func pemCertificate(data []byte) (*x509.Certificate, error) {
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, errors.New("no certificate PEM block")
-	}
-	return x509.ParseCertificate(block.Bytes)
 }

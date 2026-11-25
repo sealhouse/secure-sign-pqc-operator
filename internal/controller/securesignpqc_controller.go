@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -79,6 +80,7 @@ type SecureSignPQCReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile converges one SecureSignPQC on the profile for its spec.version.
@@ -312,11 +314,18 @@ func (r *SecureSignPQCReconciler) resetFailures(key types.NamespacedName) {
 	r.mu.Unlock()
 }
 
-// signerToInstance maps a TSA CA or signer Secret to its SecureSignPQC.
-func signerToInstance(_ context.Context, obj client.Object) []reconcile.Request {
+// keyToInstance maps a key Secret, chain record or trusted root to its
+// SecureSignPQC.
+func keyToInstance(_ context.Context, obj client.Object) []reconcile.Request {
 	labels := obj.GetLabels()
 	name, ok := labels[LabelInstance]
-	if role := labels[LabelKeyRole]; !ok || (role != RoleTSACA && role != RoleTSASigner) {
+	if !ok {
+		return nil
+	}
+	role := labels[LabelKeyRole]
+	owned := role == RoleTSASigner || labels[LabelName] == "trusted-root" ||
+		slices.ContainsFunc(caComponents, func(c caComponent) bool { return c.ownsRole(role) })
+	if !owned {
 		return nil
 	}
 	return []reconcile.Request{{Namespace: obj.GetNamespace(), Name: name}}
@@ -380,7 +389,8 @@ func (r *SecureSignPQCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.Ingress{}).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(signerToInstance)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(keyToInstance)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(keyToInstance)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Settings.Load().ConcurrentReconciles,
 			RateLimiter:             RateLimiter(r.Settings),

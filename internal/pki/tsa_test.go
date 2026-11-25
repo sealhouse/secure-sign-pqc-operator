@@ -20,8 +20,6 @@ import (
 	pqcv1alpha1 "github.com/sealhouse/secure-sign-pqc-operator/api/v1alpha1"
 )
 
-var algorithms = []pqcv1alpha1.Algorithm{pqcv1alpha1.MLDSA44, pqcv1alpha1.MLDSA65, pqcv1alpha1.MLDSA87}
-
 // passesUpstreamChecks runs the timestamp-server's own startup checks on
 // chain: the file signer loads key.pem exactly as the server does, and
 // VerifyCertChain runs with intermediate EKU enforcement on, the server
@@ -45,10 +43,25 @@ func passesUpstreamChecks(t *testing.T, chain *TSAChain) {
 	}
 }
 
+// newTSACA creates a root and a TSA intermediate under it, both with a.
+func newTSACA(t *testing.T, a pqcv1alpha1.Algorithm, subject string, now time.Time) (*Root, *CA) {
+	t.Helper()
+	root, err := NewRoot(a, subject+" root", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := root.IssueIntermediate(a, subject+" intermediate", TSAIntermediateEKU, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, ca
+}
+
 func TestTSAChainPassesUpstreamChecks(t *testing.T) {
-	for _, a := range algorithms {
+	for _, a := range Algorithms() {
 		t.Run(string(a), func(t *testing.T) {
-			chain, err := NewTSAChain(a, "test", time.Now())
+			_, ca := newTSACA(t, a, "test", time.Now())
+			chain, err := ca.IssueLeaf(a, "test", time.Now())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -63,12 +76,9 @@ func TestTSAChainPassesUpstreamChecks(t *testing.T) {
 
 // A rotated leaf may use a different ML-DSA parameter set from its CA.
 func TestMixedLevelChainPassesUpstreamChecks(t *testing.T) {
-	for _, caAlg := range algorithms {
-		ca, err := NewTSACA(caAlg, "test", time.Now())
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, leafAlg := range algorithms {
+	for _, caAlg := range Algorithms() {
+		_, ca := newTSACA(t, caAlg, "test", time.Now())
+		for _, leafAlg := range Algorithms() {
 			t.Run(fmt.Sprintf("%s CA %s leaf", caAlg, leafAlg), func(t *testing.T) {
 				chain, err := ca.IssueLeaf(leafAlg, "test", time.Now())
 				if err != nil {
@@ -89,12 +99,9 @@ func TestMixedLevelChainPassesUpstreamChecks(t *testing.T) {
 }
 
 func TestLeafExpiresWithIntermediate(t *testing.T) {
-	ca, err := NewTSACA(pqcv1alpha1.MLDSA65, "test", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Issued 14 years into a 15-year intermediate.
-	later := time.Now().Add(14 * 365 * 24 * time.Hour)
+	_, ca := newTSACA(t, pqcv1alpha1.MLDSA65, "test", time.Now())
+	// Issued half a year before the intermediate expires.
+	later := ca.Intermediate.NotAfter.Add(-180 * 24 * time.Hour)
 	chain, err := ca.IssueLeaf(pqcv1alpha1.MLDSA65, "test", later)
 	if err != nil {
 		t.Fatal(err)
@@ -104,11 +111,8 @@ func TestLeafExpiresWithIntermediate(t *testing.T) {
 	}
 }
 
-func TestDecodeTSACARoundTrip(t *testing.T) {
-	ca, err := NewTSACA(pqcv1alpha1.MLDSA87, "test", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDecodeCARoundTrip(t *testing.T) {
+	_, ca := newTSACA(t, pqcv1alpha1.MLDSA87, "test", time.Now())
 	data, err := ca.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +120,7 @@ func TestDecodeTSACARoundTrip(t *testing.T) {
 	if _, ok := data[KeyPEM]; ok {
 		t.Fatal("CA Secret data has a leaf key field")
 	}
-	got, err := DecodeTSACA(data)
+	got, err := DecodeCA(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +130,7 @@ func TestDecodeTSACARoundTrip(t *testing.T) {
 }
 
 func TestDecodeTSAChainRoundTrip(t *testing.T) {
-	ca, err := NewTSACA(pqcv1alpha1.MLDSA65, "test", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, ca := newTSACA(t, pqcv1alpha1.MLDSA65, "test", time.Now())
 	chain, err := ca.IssueLeaf(pqcv1alpha1.MLDSA65, "test", time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -189,15 +190,9 @@ func pemKey(t *testing.T, k crypto.Signer) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 }
 
-func TestDecodeTSACARejects(t *testing.T) {
-	a, err := NewTSACA(pqcv1alpha1.MLDSA65, "a", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := NewTSACA(pqcv1alpha1.MLDSA65, "b", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDecodeCARejects(t *testing.T) {
+	_, a := newTSACA(t, pqcv1alpha1.MLDSA65, "a", time.Now())
+	_, b := newTSACA(t, pqcv1alpha1.MLDSA65, "b", time.Now())
 	da, _ := a.Encode()
 	db, _ := b.Encode()
 	ecKey, ec := classicalChain(t)
@@ -213,7 +208,7 @@ func TestDecodeTSACARejects(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := DecodeTSACA(tc.data)
+			_, err := DecodeCA(tc.data)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("got %v, want error containing %q", err, tc.want)
 			}
@@ -222,14 +217,8 @@ func TestDecodeTSACARejects(t *testing.T) {
 }
 
 func TestDecodeTSAChainRejects(t *testing.T) {
-	caA, err := NewTSACA(pqcv1alpha1.MLDSA65, "a", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	caB, err := NewTSACA(pqcv1alpha1.MLDSA65, "b", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, caA := newTSACA(t, pqcv1alpha1.MLDSA65, "a", time.Now())
+	_, caB := newTSACA(t, pqcv1alpha1.MLDSA65, "b", time.Now())
 	a, err := caA.IssueLeaf(pqcv1alpha1.MLDSA65, "a", time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -276,5 +265,71 @@ func TestDecodeTSAChainRejects(t *testing.T) {
 				t.Fatalf("got %v, want error containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestIntermediateExpiresWithRoot(t *testing.T) {
+	root, err := NewRoot(pqcv1alpha1.MLDSA65, "test root", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := root.IssueIntermediate(pqcv1alpha1.MLDSA44, "test intermediate", TSAIntermediateEKU, root.Cert.NotAfter.Add(-365*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ca.Intermediate.NotAfter.Equal(root.Cert.NotAfter) {
+		t.Fatalf("intermediate NotAfter %s, root NotAfter %s", ca.Intermediate.NotAfter, root.Cert.NotAfter)
+	}
+	if got := time.Until(root.Cert.NotAfter).Round(24 * time.Hour); got != RootValidity.Round(24*time.Hour) {
+		t.Fatalf("root valid for %s, want %s", got, RootValidity)
+	}
+}
+
+func TestDecodeRoot(t *testing.T) {
+	a, err := NewRoot(pqcv1alpha1.MLDSA87, "a", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewRoot(pqcv1alpha1.MLDSA87, "b", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	da, _ := a.Encode()
+	db, _ := b.Encode()
+	got, err := DecodeRoot(da)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Cert.Equal(a.Cert) || !got.Key.Equal(a.Key) {
+		t.Fatal("decoded root differs from the encoded one")
+	}
+	_, ca := newTSACA(t, pqcv1alpha1.MLDSA65, "c", time.Now())
+	cases := map[string]struct {
+		data map[string][]byte
+		want string
+	}{
+		"key from elsewhere": {map[string][]byte{RootKeyPEM: db[RootKeyPEM], RootPEM: da[RootPEM]}, "does not match the root"},
+		"not self-signed":    {map[string][]byte{RootKeyPEM: pemKey(t, ca.Key), RootPEM: encodeCerts(ca.Intermediate)}, "not self-signed"},
+		"missing key":        {map[string][]byte{RootPEM: da[RootPEM]}, "no PRIVATE KEY"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodeRoot(tc.data)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The public chain decodes without the key and matches the CA.
+func TestDecodeChain(t *testing.T) {
+	_, ca := newTSACA(t, pqcv1alpha1.MLDSA65, "test", time.Now())
+	got, err := DecodeChain(ca.EncodeChain())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != nil || !got.Intermediate.Equal(ca.Intermediate) || !got.Root.Equal(ca.Root) {
+		t.Fatal("decoded chain differs from the CA")
 	}
 }

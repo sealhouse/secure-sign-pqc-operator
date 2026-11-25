@@ -1061,13 +1061,15 @@ spec:
                   signing:
                     default:
                       algorithm: ML-DSA-65
+                      intermediateGeneration: 1
+                      rootGeneration: 1
                       signerGeneration: 1
                     description: signing configures the TSA's CA and signing keys.
                     properties:
                       acceptWeakerAlgorithm:
                         description: |-
                           acceptWeakerAlgorithm acknowledges one move to a weaker parameter
-                          set: the named algorithm, for the named signer generation only.
+                          set: the named algorithm, for the keys of the named generation only.
                         properties:
                           algorithm:
                             description: algorithm is the weaker parameter set accepted.
@@ -1076,16 +1078,34 @@ spec:
                             - ML-DSA-65
                             - ML-DSA-87
                             type: string
+                          intermediateGeneration:
+                            description: |-
+                              intermediateGeneration is the intermediate CA rotation that may use
+                              it, for the intermediate and the signer issued from it.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          rootGeneration:
+                            description: |-
+                              rootGeneration is the root CA rotation that may use it, for the root,
+                              its intermediate and the signer issued from them.
+                            format: int32
+                            minimum: 1
+                            type: integer
                           signerGeneration:
-                            description: signerGeneration is the one generation that
-                              may use it.
+                            description: signerGeneration is the signer generation
+                              that may use it.
                             format: int32
                             minimum: 1
                             type: integer
                         required:
                         - algorithm
-                        - signerGeneration
                         type: object
+                        x-kubernetes-validations:
+                        - message: name the signerGeneration, intermediateGeneration
+                            or rootGeneration that may use the weaker algorithm
+                          rule: has(self.signerGeneration) || has(self.intermediateGeneration)
+                            || has(self.rootGeneration)
                       algorithm:
                         default: ML-DSA-65
                         description: |-
@@ -1096,6 +1116,28 @@ spec:
                         - ML-DSA-65
                         - ML-DSA-87
                         type: string
+                      intermediateGeneration:
+                        default: 1
+                        description: |-
+                          intermediateGeneration selects the intermediate CA. Raising it issues
+                          a new intermediate under the current root.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                        x-kubernetes-validations:
+                        - message: intermediateGeneration may not decrease
+                          rule: self >= oldSelf
+                      rootGeneration:
+                        default: 1
+                        description: |-
+                          rootGeneration selects the root CA. Raising it issues a new root and
+                          a new intermediate under it.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                        x-kubernetes-validations:
+                        - message: rootGeneration may not decrease
+                          rule: self >= oldSelf
                       signerGeneration:
                         default: 1
                         description: signerGeneration selects the signing key. Raising
@@ -1109,15 +1151,16 @@ spec:
                     type: object
                     x-kubernetes-validations:
                     - message: 'algorithm is weaker than before: set acceptWeakerAlgorithm
-                        to this algorithm and the signer generation that will use
-                        it'
-                      rule: '!((oldSelf.algorithm == ''ML-DSA-87'' && self.algorithm
-                        != ''ML-DSA-87'') || (oldSelf.algorithm == ''ML-DSA-65'' &&
-                        self.algorithm == ''ML-DSA-44'')) || (has(self.acceptWeakerAlgorithm)
-                        && self.acceptWeakerAlgorithm.algorithm == self.algorithm
-                        && self.acceptWeakerAlgorithm.signerGeneration == (self.signerGeneration
-                        > oldSelf.signerGeneration ? self.signerGeneration : oldSelf.signerGeneration
-                        + 1))'
+                        to this algorithm and the generation that will use it'
+                      rule: '{''ML-DSA-44'': 1, ''ML-DSA-65'': 2, ''ML-DSA-87'': 3}[self.algorithm]
+                        >= {''ML-DSA-44'': 1, ''ML-DSA-65'': 2, ''ML-DSA-87'': 3}[oldSelf.algorithm]
+                        || (self.?acceptWeakerAlgorithm.algorithm == optional.of(self.algorithm)
+                        && (self.?acceptWeakerAlgorithm.?signerGeneration == optional.of([self.signerGeneration,
+                        oldSelf.signerGeneration + 1].max()) || self.?acceptWeakerAlgorithm.?intermediateGeneration
+                        == optional.of([self.intermediateGeneration, oldSelf.intermediateGeneration
+                        + 1].max()) || self.?acceptWeakerAlgorithm.?rootGeneration
+                        == optional.of([self.rootGeneration, oldSelf.rootGeneration
+                        + 1].max())))'
                   tolerations:
                     description: tolerations let the pods run on nodes with matching
                       taints.
@@ -1421,53 +1464,79 @@ spec:
               tsa:
                 description: tsa reports the timestamp authority's endpoints and keys.
                 properties:
-                  ca:
-                    description: ca is the intermediate CA that issues the signing
-                      keys.
-                    properties:
-                      algorithm:
-                        description: algorithm is the key's ML-DSA parameter set.
-                        enum:
-                        - ML-DSA-44
-                        - ML-DSA-65
-                        - ML-DSA-87
-                        type: string
-                      generation:
-                        description: generation is the key's signerGeneration; a CA
-                          has none.
-                        format: int32
-                        type: integer
-                      notAfter:
-                        format: date-time
-                        type: string
-                      notBefore:
-                        description: notBefore and notAfter are the certificate's
-                          validity period.
-                        format: date-time
-                        type: string
-                      retiredAt:
-                        description: retiredAt is when the private key was deleted.
-                        format: date-time
-                        type: string
-                      serialNumber:
-                        description: serialNumber is the hex serial number of the
-                          key's certificate.
-                        maxLength: 64
-                        type: string
-                      stage:
-                        description: stage is Pending, Active or Retired.
-                        enum:
-                        - Pending
-                        - Active
-                        - Retired
-                        type: string
-                    required:
-                    - algorithm
-                    - notAfter
-                    - notBefore
-                    - serialNumber
-                    - stage
-                    type: object
+                  cas:
+                    description: |-
+                      cas are the roots and intermediates, newest first, including retired
+                      ones that are still in the trusted root.
+                    items:
+                      description: CAStatus describes one root or intermediate CA.
+                      properties:
+                        algorithm:
+                          description: algorithm is the key's ML-DSA parameter set.
+                          enum:
+                          - ML-DSA-44
+                          - ML-DSA-65
+                          - ML-DSA-87
+                          type: string
+                        intermediateGeneration:
+                          description: intermediateGeneration is an intermediate's
+                            generation.
+                          format: int32
+                          type: integer
+                        issuerSerialNumber:
+                          description: |-
+                            issuerSerialNumber is the hex serial number of the CA certificate that
+                            signed it; a root has none.
+                          maxLength: 64
+                          type: string
+                        kind:
+                          description: kind is Root or Intermediate.
+                          enum:
+                          - Root
+                          - Intermediate
+                          type: string
+                        notAfter:
+                          format: date-time
+                          type: string
+                        notBefore:
+                          description: notBefore and notAfter are the certificate's
+                            validity period.
+                          format: date-time
+                          type: string
+                        retiredAt:
+                          description: |-
+                            retiredAt is when it stopped being used. A retired signer's private
+                            key is deleted; a retired CA stays in the trusted root with this
+                            validity end.
+                          format: date-time
+                          type: string
+                        rootGeneration:
+                          description: rootGeneration is the CA's root generation.
+                          format: int32
+                          type: integer
+                        serialNumber:
+                          description: serialNumber is the hex serial number of the
+                            certificate.
+                          maxLength: 64
+                          type: string
+                        stage:
+                          description: stage is Pending, Active or Retired.
+                          enum:
+                          - Pending
+                          - Active
+                          - Retired
+                          type: string
+                      required:
+                      - algorithm
+                      - kind
+                      - notAfter
+                      - notBefore
+                      - rootGeneration
+                      - serialNumber
+                      - stage
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
                   externalURL:
                     description: |-
                       externalURL is its base URL through its Ingress, when
@@ -1488,10 +1557,15 @@ spec:
                           - ML-DSA-87
                           type: string
                         generation:
-                          description: generation is the key's signerGeneration; a
-                            CA has none.
+                          description: generation is the key's signerGeneration.
                           format: int32
                           type: integer
+                        issuerSerialNumber:
+                          description: |-
+                            issuerSerialNumber is the hex serial number of the CA certificate that
+                            signed it; a root has none.
+                          maxLength: 64
+                          type: string
                         notAfter:
                           format: date-time
                           type: string
@@ -1501,12 +1575,15 @@ spec:
                           format: date-time
                           type: string
                         retiredAt:
-                          description: retiredAt is when the private key was deleted.
+                          description: |-
+                            retiredAt is when it stopped being used. A retired signer's private
+                            key is deleted; a retired CA stays in the trusted root with this
+                            validity end.
                           format: date-time
                           type: string
                         serialNumber:
                           description: serialNumber is the hex serial number of the
-                            key's certificate.
+                            certificate.
                           maxLength: 64
                           type: string
                         stage:
@@ -1518,6 +1595,7 @@ spec:
                           type: string
                       required:
                       - algorithm
+                      - generation
                       - notAfter
                       - notBefore
                       - serialNumber

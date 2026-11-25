@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,8 +49,8 @@ type SecureSignPQCSpec struct {
 	TSA TSASpec `json:"tsa,omitzero"`
 }
 
-// SigningSpec configures a component's signing keys.
-// +kubebuilder:validation:XValidation:rule="!((oldSelf.algorithm == 'ML-DSA-87' && self.algorithm != 'ML-DSA-87') || (oldSelf.algorithm == 'ML-DSA-65' && self.algorithm == 'ML-DSA-44')) || (has(self.acceptWeakerAlgorithm) && self.acceptWeakerAlgorithm.algorithm == self.algorithm && self.acceptWeakerAlgorithm.signerGeneration == (self.signerGeneration > oldSelf.signerGeneration ? self.signerGeneration : oldSelf.signerGeneration + 1))",message="algorithm is weaker than before: set acceptWeakerAlgorithm to this algorithm and the signer generation that will use it"
+// SigningSpec configures a component's CA and signing keys.
+// +kubebuilder:validation:XValidation:rule="{'ML-DSA-44': 1, 'ML-DSA-65': 2, 'ML-DSA-87': 3}[self.algorithm] >= {'ML-DSA-44': 1, 'ML-DSA-65': 2, 'ML-DSA-87': 3}[oldSelf.algorithm] || (self.?acceptWeakerAlgorithm.algorithm == optional.of(self.algorithm) && (self.?acceptWeakerAlgorithm.?signerGeneration == optional.of([self.signerGeneration, oldSelf.signerGeneration + 1].max()) || self.?acceptWeakerAlgorithm.?intermediateGeneration == optional.of([self.intermediateGeneration, oldSelf.intermediateGeneration + 1].max()) || self.?acceptWeakerAlgorithm.?rootGeneration == optional.of([self.rootGeneration, oldSelf.rootGeneration + 1].max())))",message="algorithm is weaker than before: set acceptWeakerAlgorithm to this algorithm and the generation that will use it"
 type SigningSpec struct {
 	// algorithm is the ML-DSA parameter set for the next key the operator
 	// creates for this component.
@@ -63,22 +65,52 @@ type SigningSpec struct {
 	// +optional
 	SignerGeneration int32 `json:"signerGeneration,omitempty"`
 
+	// intermediateGeneration selects the intermediate CA. Raising it issues
+	// a new intermediate under the current root.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="intermediateGeneration may not decrease"
+	// +optional
+	IntermediateGeneration int32 `json:"intermediateGeneration,omitempty"`
+
+	// rootGeneration selects the root CA. Raising it issues a new root and
+	// a new intermediate under it.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="rootGeneration may not decrease"
+	// +optional
+	RootGeneration int32 `json:"rootGeneration,omitempty"`
+
 	// acceptWeakerAlgorithm acknowledges one move to a weaker parameter
-	// set: the named algorithm, for the named signer generation only.
+	// set: the named algorithm, for the keys of the named generation only.
 	// +optional
 	AcceptWeakerAlgorithm *WeakerAlgorithmAcceptance `json:"acceptWeakerAlgorithm,omitempty"`
 }
 
-// WeakerAlgorithmAcceptance accepts a weaker parameter set for one key.
+// WeakerAlgorithmAcceptance accepts a weaker parameter set for the keys of
+// one generation: a signer, or the CA a rotation issues with its signer.
+// +kubebuilder:validation:XValidation:rule="has(self.signerGeneration) || has(self.intermediateGeneration) || has(self.rootGeneration)",message="name the signerGeneration, intermediateGeneration or rootGeneration that may use the weaker algorithm"
 type WeakerAlgorithmAcceptance struct {
 	// algorithm is the weaker parameter set accepted.
 	// +required
 	Algorithm Algorithm `json:"algorithm"`
 
-	// signerGeneration is the one generation that may use it.
+	// signerGeneration is the signer generation that may use it.
 	// +kubebuilder:validation:Minimum=1
-	// +required
-	SignerGeneration int32 `json:"signerGeneration"`
+	// +optional
+	SignerGeneration int32 `json:"signerGeneration,omitempty"`
+
+	// intermediateGeneration is the intermediate CA rotation that may use
+	// it, for the intermediate and the signer issued from it.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	IntermediateGeneration int32 `json:"intermediateGeneration,omitempty"`
+
+	// rootGeneration is the root CA rotation that may use it, for the root,
+	// its intermediate and the signer issued from them.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RootGeneration int32 `json:"rootGeneration,omitempty"`
 }
 
 // TSASpec configures the timestamp authority.
@@ -90,7 +122,7 @@ type TSASpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// signing configures the TSA's CA and signing keys.
-	// +kubebuilder:default={algorithm: "ML-DSA-65", signerGeneration: 1}
+	// +kubebuilder:default={algorithm: "ML-DSA-65", signerGeneration: 1, intermediateGeneration: 1, rootGeneration: 1}
 	// +optional
 	Signing SigningSpec `json:"signing,omitzero"`
 
@@ -184,20 +216,22 @@ const (
 	KeyRetired KeyStage = "Retired"
 )
 
-// KeyStatus describes one signing key.
-type KeyStatus struct {
-	// generation is the key's signerGeneration; a CA has none.
-	// +optional
-	Generation int32 `json:"generation,omitempty"`
-
+// CertificateStatus describes the certificate of a key or CA.
+type CertificateStatus struct {
 	// algorithm is the key's ML-DSA parameter set.
 	// +required
 	Algorithm Algorithm `json:"algorithm"`
 
-	// serialNumber is the hex serial number of the key's certificate.
+	// serialNumber is the hex serial number of the certificate.
 	// +kubebuilder:validation:MaxLength=64
 	// +required
 	SerialNumber string `json:"serialNumber"`
+
+	// issuerSerialNumber is the hex serial number of the CA certificate that
+	// signed it; a root has none.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	IssuerSerialNumber string `json:"issuerSerialNumber,omitempty"`
 
 	// notBefore and notAfter are the certificate's validity period.
 	// +required
@@ -209,9 +243,52 @@ type KeyStatus struct {
 	// +required
 	Stage KeyStage `json:"stage"`
 
-	// retiredAt is when the private key was deleted.
+	// retiredAt is when it stopped being used. A retired signer's private
+	// key is deleted; a retired CA stays in the trusted root with this
+	// validity end.
 	// +optional
 	RetiredAt *metav1.Time `json:"retiredAt,omitempty"`
+}
+
+// KeyStatus describes one signing key.
+type KeyStatus struct {
+	// generation is the key's signerGeneration.
+	// +required
+	Generation int32 `json:"generation"`
+
+	CertificateStatus `json:",inline"`
+}
+
+// CAKind is a root or an intermediate CA.
+// +kubebuilder:validation:Enum=Root;Intermediate
+type CAKind string
+
+const (
+	CARoot         CAKind = "Root"
+	CAIntermediate CAKind = "Intermediate"
+)
+
+// CAStatus describes one root or intermediate CA.
+type CAStatus struct {
+	// kind is Root or Intermediate.
+	// +required
+	Kind CAKind `json:"kind"`
+
+	// rootGeneration is the CA's root generation.
+	// +required
+	RootGeneration int32 `json:"rootGeneration"`
+
+	// intermediateGeneration is an intermediate's generation.
+	// +optional
+	IntermediateGeneration int32 `json:"intermediateGeneration,omitempty"`
+
+	CertificateStatus `json:",inline"`
+}
+
+// String is "<kind> <root>-<intermediate> <stage>", with intermediate 0 for
+// a root.
+func (s CAStatus) String() string {
+	return fmt.Sprintf("%s %d-%d %s", s.Kind, s.RootGeneration, s.IntermediateGeneration, s.Stage)
 }
 
 // TSAStatus reports the timestamp authority's endpoints and keys.
@@ -225,9 +302,11 @@ type TSAStatus struct {
 	// +optional
 	ExternalURL string `json:"externalURL,omitempty"`
 
-	// ca is the intermediate CA that issues the signing keys.
+	// cas are the roots and intermediates, newest first, including retired
+	// ones that are still in the trusted root.
+	// +listType=atomic
 	// +optional
-	CA *KeyStatus `json:"ca,omitempty"`
+	CAs []CAStatus `json:"cas,omitempty"`
 
 	// signers are the signing keys, newest first: the current generation,
 	// any older key still in use, then retired keys.
@@ -250,6 +329,9 @@ const (
 	// ConditionCertificatesExpiring is True when a certificate in use
 	// expires within the operator's expiry_warning window.
 	ConditionCertificatesExpiring = "CertificatesExpiring"
+	// ConditionTSACARotation is True while a TSA CA rotation rolls out,
+	// with reason RotationHeld when a further raise waits for it.
+	ConditionTSACARotation = "TSACARotation"
 )
 
 // FIPSAnnotation on a SecureSignPQC sets the FIPS 140-3 mode of its

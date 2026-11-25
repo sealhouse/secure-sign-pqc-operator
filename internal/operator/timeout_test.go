@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,24 +15,12 @@ import (
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/tuning"
 )
 
-type countWatches struct {
-	next    http.RoundTripper
-	watches *atomic.Int32
-}
-
-func (c countWatches) RoundTrip(req *http.Request) (*http.Response, error) {
-	if isWatch(req) {
-		c.watches.Add(1)
-	}
-	return c.next.RoundTrip(req)
-}
-
 // api_timeout bounds requests, not watch streams: informers keep their
 // watches open well past it instead of reconnecting every api_timeout.
 func TestAPITimeoutLeavesWatchesOpen(t *testing.T) {
-	var watches atomic.Int32
-	c := rest.CopyConfig(cfg)
-	c.Wrap(func(rt http.RoundTripper) http.RoundTripper { return countWatches{rt, &watches} })
+	var reqs requests
+	c := reqs.wrap(cfg)
+	watches := &reqs.watches
 	startOperatorWith(t, c, createNamespace(t, "op"), func(o *Options) { o.Effective.APITimeout = time.Second })
 	eventually(t, 10*time.Second, "informers watching", func() error {
 		if watches.Load() == 0 {

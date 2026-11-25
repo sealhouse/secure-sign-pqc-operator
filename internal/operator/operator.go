@@ -88,8 +88,12 @@ func NewManager(cfg *rest.Config, o Options, restart func(tuning.Settings)) (man
 			&appsv1.Deployment{}:    {Label: managed},
 			&corev1.Service{}:       {Label: managed},
 			&networkingv1.Ingress{}: {Label: managed},
-			// The tuning ConfigMap, and the metrics CA ConfigMap.
-			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{o.Namespace: {}}},
+			// The tuning and metrics CA ConfigMaps in the operator's
+			// namespace; elsewhere the chain records and trusted roots.
+			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{
+				o.Namespace:         {},
+				cache.AllNamespaces: {LabelSelector: managed},
+			}},
 		},
 	}
 	if o.Metrics.Service != "" {

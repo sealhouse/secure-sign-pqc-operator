@@ -123,7 +123,7 @@ func TestAPIErrorsDegradeAndRecover(t *testing.T) {
 			})
 			// Nothing was deleted: the signer was created before the
 			// failing write and is still the only one.
-			first := signerSecret(t, ns, 1)
+			first := signerSecret(t, ns, 1, 1, 1)
 
 			f.set(nil)
 			markAvailable(t, ns)
@@ -134,7 +134,7 @@ func TestAPIErrorsDegradeAndRecover(t *testing.T) {
 				}
 				return conditionIs(cr, pqcv1alpha1.ConditionReady, metav1.ConditionTrue, "")
 			})
-			if signerSecret(t, ns, 1).UID != first.UID {
+			if signerSecret(t, ns, 1, 1, 1).UID != first.UID {
 				t.Fatal("signer Secret replaced during the fault")
 			}
 		})
@@ -362,7 +362,7 @@ func TestRunRestartsInProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, 30*time.Second, "signer issued by the new manager", func() error {
-		return k8s.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: controller.TSASignerSecretName("demo", 1)}, &corev1.Secret{})
+		return k8s.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: controller.TSASignerSecretName("demo", 1, 1, 1)}, &corev1.Secret{})
 	})
 	select {
 	case err := <-done:

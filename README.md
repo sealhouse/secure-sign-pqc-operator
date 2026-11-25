@@ -9,13 +9,27 @@ channel, and the API may change.
 
 ## What an instance gets
 
-- A CA (root and intermediate) and a TSA signing key, each in a Secret in the
-  instance's namespace. Existing Secrets are used as they are; the operator
-  never overwrites a key. A restored Secret needs the labels the operator
-  gives its own: `app.kubernetes.io/instance: <name>`,
+- A root CA, an intermediate CA and a TSA signing key, each in a Secret in
+  the instance's namespace: `<name>-tsa-root-<r>`,
+  `<name>-tsa-intermediate-<r>-<i>` and `<name>-tsa-signer-<r>-<i>-<s>`.
+  Certificates last 10 years (root), 5 years (intermediate, never past its
+  root) and 1 year (signer, never past its intermediate), as Sigstore issues
+  them. Existing Secrets are used as they are; the operator never overwrites
+  a key. A restored Secret needs the labels the operator gives its own:
+  `app.kubernetes.io/instance: <name>`,
   `app.kubernetes.io/managed-by: rhtas-pqc-operator`,
-  `pqc.rhtas.redhat.com/key-role` (`tsa-ca` or `tsa-signer`) and, on a
-  signer, `pqc.rhtas.redhat.com/key-generation`.
+  `pqc.rhtas.redhat.com/key-role` (`tsa-root`, `tsa-intermediate` or
+  `tsa-signer`), `pqc.rhtas.redhat.com/root-generation`, and on an
+  intermediate or signer `pqc.rhtas.redhat.com/intermediate-generation`, and
+  on a signer `pqc.rhtas.redhat.com/key-generation`.
+- A Sigstore trusted root in the ConfigMap `<name>-trusted-root`
+  (`trusted_root.json`), listing one timestamp authority per intermediate
+  the instance has used. Retired intermediates stay in it with the end of
+  their validity period set, so older timestamps keep verifying. Each
+  intermediate's public chain is also kept in a ConfigMap
+  `<name>-tsa-chain-<r>-<i>`. Deleting the instance leaves the key Secrets
+  and chain ConfigMaps in place, so an instance recreated with the same name
+  and generations carries on with the same keys and trusted root.
 - A TSA Deployment and ClusterIP Service, at the URL in `status.tsa.url`.
 - With `spec.tsa.ingress.enabled`, an Ingress for the TSA, at the URL in
   `status.tsa.externalURL`. On OpenShift the router serves it over TLS
@@ -24,10 +38,32 @@ channel, and the API may change.
   TLS is up to the ingress controller. Traffic inside the cluster is plain
   HTTP. The Ingress cannot be disabled once enabled, and the
   `TSAIngressReady` condition reports it.
-- Key rotation: raising `spec.tsa.signing.signerGeneration` issues a new
-  signing key from the same CA, rolls the pods onto it, and deletes the old
-  private key once no pod uses it. A key weaker than the one in use needs
-  `spec.tsa.signing.acceptWeakerAlgorithm`.
+- Key rotation, each by raising a counter under `spec.tsa.signing`, which
+  can only go up:
+  - `signerGeneration` issues a new signing key from the same intermediate.
+  - `intermediateGeneration` issues a new intermediate from the same root,
+    and a signing key from it.
+  - `rootGeneration` issues a new root, an intermediate under it and a
+    signing key.
+
+  The operator adds a new intermediate to the trusted root before any pod
+  signs with it, rolls the pods onto the new key, and once no pod uses the
+  old keys deletes their private keys and marks the old intermediate
+  retired in the trusted root, its validity ending 30 seconds later, while
+  terminating pods may still sign. `status.tsa.cas` lists each root and
+  intermediate with its stage, and the `TSACARotation` condition is True
+  while a CA rotation rolls out. Raising a CA counter during a CA rotation
+  waits for it to finish, with reason `RotationHeld` and a Warning event.
+  If a root's key Secret is deleted, an intermediate rotation under it
+  holds the instance with `Ready` False, reason `RootKeyUnavailable`, until
+  `rootGeneration` is raised. A key weaker than
+  the one it replaces needs `spec.tsa.signing.acceptWeakerAlgorithm`,
+  naming the algorithm and the `signerGeneration`, `intermediateGeneration`
+  or `rootGeneration` it is for.
+
+  The generated root key is held in a Secret like the other keys. For
+  production, plan to keep the root offline: user-supplied CAs and KMS-held
+  keys are planned.
 - Pod options under `spec.tsa`: `resources` (replacing the defaults of 50m
   CPU and 64Mi memory requested, 256Mi memory limit), `nodeSelector`,
   `tolerations`, `affinity`, `topologySpreadConstraints` and
@@ -52,8 +88,8 @@ operator derives from it stay within Kubernetes limits.
 
 `kubectl get securesignpqc -o wide` shows the version, key algorithms and
 readiness; `status.conditions` has `Ready`, `TSAReady`, `TSAIngressReady`,
-`Degraded` and `CertificatesExpiring`, which turns True, with a Warning event, when a TSA
-signer in use or the CA certificate expires within the `expiry_warning` setting (90
+`Degraded`, `TSACARotation` and `CertificatesExpiring`, which turns True, with a Warning event, when a TSA
+signer or CA certificate in use expires within the `expiry_warning` setting (90
 days by default).
 
 The TSA pods run in FIPS 140-3 mode when the node's kernel is. The

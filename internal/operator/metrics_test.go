@@ -294,7 +294,7 @@ func (s *serviceMonitorRequests) wrap(rt http.RoundTripper) http.RoundTripper {
 		}
 		s.requests.Add(1)
 		resp, err := rt.RoundTrip(req)
-		if w := req.URL.Query().Get("watch"); err == nil && (w == "true" || w == "1") {
+		if err == nil && isWatch(req) {
 			s.watches.Add(1)
 			resp.Body = &closeFunc{ReadCloser: resp.Body, close: func() { s.watches.Add(-1) }}
 		}
