@@ -177,12 +177,18 @@ type exit struct {
 // supervisor plays the kubelet for one operator container: it runs the
 // binary's startup path (LoadTuning, then Run, with leader election) and
 // starts it again whenever it returns, recording every exit.
+// supervisors numbers each supervisor's controller, so its metrics start
+// from zero in series no other operator in the process writes.
+var supervisors atomic.Int32
+
 type supervisor struct {
-	t      *testing.T
-	name   string
-	reg    *prometheus.Registry
-	cancel context.CancelFunc
-	done   chan struct{}
+	t    *testing.T
+	name string
+	// controller names the operator's controller across its restarts.
+	controller string
+	reg        *prometheus.Registry
+	cancel     context.CancelFunc
+	done       chan struct{}
 
 	mu    sync.Mutex
 	exits []exit
@@ -211,7 +217,8 @@ func supervise(t *testing.T, so supervisorOptions) *supervisor {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &supervisor{t: t, name: so.name, reg: prometheus.NewRegistry(), cancel: cancel, done: make(chan struct{})}
+	s := &supervisor{t: t, name: so.name, controller: fmt.Sprintf("%s-%d", controller.ControllerName, supervisors.Add(1)),
+		reg: prometheus.NewRegistry(), cancel: cancel, done: make(chan struct{})}
 	log := logf.Log.WithName(so.name)
 	go func() {
 		defer close(s.done)
@@ -235,6 +242,7 @@ func supervise(t *testing.T, so supervisorOptions) *supervisor {
 				LeaderElection: true,
 				// Each supervisor is one pod: its restarts keep the name.
 				LeaderElectionIdentity: so.name,
+				ControllerName:         s.controller,
 				Registry:               s.reg,
 			}
 			if so.edit != nil {
@@ -378,7 +386,6 @@ func installReady(t *testing.T, ns string, timeout time.Duration) {
 	if err := k8s.Create(context.Background(), cr); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { deleteInstance(t, cr) })
 	eventually(t, timeout, "TSA Deployment", func() error {
 		return k8s.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: controller.TSAName("demo")}, &appsv1.Deployment{})
 	})
@@ -386,22 +393,6 @@ func installReady(t *testing.T, ns string, timeout time.Duration) {
 	eventually(t, timeout, "Ready", func() error {
 		return conditionIs(getCR(t, ns), pqcv1alpha1.ConditionReady, "True", "")
 	})
-}
-
-// deleteInstance deletes an instance and the objects it made.
-func deleteInstance(t *testing.T, cr *pqcv1alpha1.SecureSignPQC) {
-	t.Helper()
-	ctx := context.Background()
-	if err := client.IgnoreNotFound(k8s.Delete(ctx, cr)); err != nil {
-		t.Error(err)
-	}
-	// The key Secrets are watched too, mapped to their instance by label.
-	own := client.MatchingLabels{controller.LabelInstance: cr.Name}
-	for _, obj := range []client.Object{&appsv1.Deployment{}, &corev1.Service{}, &corev1.Secret{}} {
-		if err := k8s.DeleteAllOf(ctx, obj, client.InNamespace(cr.Namespace), own); err != nil {
-			t.Error(err)
-		}
-	}
 }
 
 // replicasApplied waits until the TSA Deployment asks for n replicas.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,8 +20,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,8 +51,8 @@ var (
 	k8s     client.Client
 )
 
-// suiteCleanups run after every test, before envtest stops: processes a
-// test file starts once for the whole package.
+// suiteCleanups run after every test: processes a test file starts once for
+// the whole package.
 var suiteCleanups []func()
 
 func TestMain(m *testing.M) {
@@ -62,33 +68,39 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}
-	crds, err := operatorCRDs()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "CRDs:", err)
-		os.Exit(1)
-	}
-	testEnv = &envtest.Environment{
-		CRDs:                  crds,
-		BinaryAssetsDirectory: envtestAssets(),
-	}
-	cfg, err = testEnv.Start()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "envtest:", err)
-		os.Exit(1)
-	}
-	k8s, err = client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	stopOnSignal()
 	code := m.Run()
 	for _, f := range suiteCleanups {
 		f()
 	}
-	if err := testEnv.Stop(); err != nil {
-		fmt.Fprintln(os.Stderr, "envtest stop:", err)
-	}
 	os.Exit(code)
+}
+
+// freshEnv starts an API server for t alone and points testEnv, cfg and k8s
+// at it until t ends. It comes first in a test, so the server outlives the
+// test's other cleanups.
+func freshEnv(t *testing.T) {
+	t.Helper()
+	crds, err := operatorCRDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &envtest.Environment{CRDs: crds, BinaryAssetsDirectory: envtestAssets()}
+	c, err := startEnv(env)
+	t.Cleanup(func() {
+		if err := stopEnv(env); err != nil {
+			t.Errorf("envtest stop: %v", err)
+		}
+		testEnv, cfg, k8s = nil, nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kc, err := client.New(c, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testEnv, cfg, k8s = env, c, kc
 }
 
 func zapLevel() zapcore.Level {
@@ -280,13 +292,108 @@ func startOperatorWith(t *testing.T, restCfg *rest.Config, namespace string, edi
 	return r
 }
 
+// createNamespace creates a namespace that is emptied and removed when t
+// ends.
 func createNamespace(t *testing.T, prefix string) string {
 	t.Helper()
 	ns := &corev1.Namespace{GenerateName: prefix + "-"}
 	if err := k8s.Create(context.Background(), ns); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { removeNamespace(t, ns.Name) })
 	return ns.Name
+}
+
+// removeNamespace does what envtest's missing namespace controller and
+// garbage collector would: it deletes everything in ns, instances first so
+// an operator still running does not recreate what they own, then ns.
+func removeNamespace(t *testing.T, ns string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := k8s.DeleteAllOf(ctx, &pqcv1alpha1.SecureSignPQC{}, client.InNamespace(ns)); err != nil {
+		t.Errorf("delete instances in %s: %v", ns, err)
+		return
+	}
+	disc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	lists, err := disc.ServerPreferredNamespacedResources()
+	if err != nil {
+		t.Errorf("discovery: %v", err)
+		return
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	var resources []schema.GroupVersionResource
+	for _, l := range lists {
+		gv, err := schema.ParseGroupVersion(l.GroupVersion)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		for _, r := range l.APIResources {
+			if !strings.Contains(r.Name, "/") && slices.Contains(r.Verbs, "deletecollection") && slices.Contains(r.Verbs, "list") {
+				resources = append(resources, gv.WithResource(r.Name))
+			}
+		}
+	}
+	// A write already in flight when the instances went can land after its
+	// resource was emptied. A resource whose CRD a test removed is empty.
+	background := metav1.DeletePropagationBackground
+	eventually(t, 30*time.Second, "namespace "+ns+" emptied", func() error {
+		var left []string
+		for _, r := range resources {
+			err := dyn.Resource(r).Namespace(ns).DeleteCollection(ctx, metav1.DeleteOptions{PropagationPolicy: &background}, metav1.ListOptions{})
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("delete %s: %w", r.Resource, err)
+			}
+			l, err := dyn.Resource(r).Namespace(ns).List(ctx, metav1.ListOptions{})
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("list %s: %w", r.Resource, err)
+			}
+			for _, o := range l.Items {
+				left = append(left, r.Resource+"/"+o.GetName())
+			}
+		}
+		if len(left) > 0 {
+			return fmt.Errorf("left: %v", left)
+		}
+		return nil
+	})
+	// Finalizing in place of the namespace controller lets the delete
+	// complete.
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if err := cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
+		t.Errorf("delete namespace %s: %v", ns, err)
+		return
+	}
+	n, err := cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	n.Spec.Finalizers = nil
+	if _, err := cs.CoreV1().Namespaces().Finalize(ctx, n, metav1.UpdateOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		t.Errorf("finalize namespace %s: %v", ns, err)
+	}
 }
 
 // eventually polls f until it returns nil, failing the test if timeout

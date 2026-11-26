@@ -25,6 +25,7 @@ func resilienceSettings() tuning.Settings {
 
 // The API server refuses connections.
 func TestResilienceAPIServerRefuses(t *testing.T) {
+	freshEnv(t)
 	t.Run("30s", func(t *testing.T) { refusedOutage(t, 30*time.Second) })
 	t.Run("10m", func(t *testing.T) {
 		if os.Getenv("RESILIENCE_LONG") == "" {
@@ -72,6 +73,7 @@ func refusedOutage(t *testing.T, outage time.Duration) {
 // A refused-connection outage with the environment's slow production
 // timings, overridden through the ConfigMap.
 func TestResilienceTunedRecovery(t *testing.T) {
+	freshEnv(t)
 	env := tuning.Defaults()
 	p := newAPIProxy(t, "tuned")
 	opns := createNamespace(t, "op")

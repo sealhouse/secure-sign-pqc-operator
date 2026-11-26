@@ -26,6 +26,7 @@ func getIngress(ctx context.Context, ns string) (*networkingv1.Ingress, error) {
 }
 
 func TestIngressRules(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "ingress-crd")
 	cr := newInstance(ns)
@@ -73,6 +74,7 @@ func TestIngressRules(t *testing.T) {
 // Off OpenShift the Ingress needs a host, and serves plain HTTP. Without
 // one the TSA still runs and rotates.
 func TestIngressKubernetes(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "ingress")
@@ -154,6 +156,7 @@ func openShiftCRDs() []*apiextensionsv1.CustomResourceDefinition {
 // On OpenShift the host defaults from the cluster domain and the router
 // terminates TLS.
 func TestIngressOpenShift(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	installCRDs(t, t, openShiftCRDs()...)
 	cluster := &unstructured.Unstructured{Object: map[string]any{

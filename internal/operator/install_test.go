@@ -39,6 +39,7 @@ func newInstance(ns string) *pqcv1alpha1.SecureSignPQC {
 }
 
 func TestCRDDefaultsAndValidation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "crd")
 
@@ -114,6 +115,7 @@ func TestCRDDefaultsAndValidation(t *testing.T) {
 // acceptWeakerAlgorithm to name it and the next generation; any other move
 // needs nothing.
 func TestAlgorithmRule(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "algorithm")
 	algorithms := pki.Algorithms()
@@ -180,6 +182,7 @@ func TestAlgorithmRule(t *testing.T) {
 // An acceptance left in the spec from one downgrade does not pass a later
 // one: it names a generation that is no longer above the current one.
 func TestStaleAcceptanceRefused(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "stale")
 	cr := newInstance(ns)
@@ -370,6 +373,7 @@ func publishedIntermediates(ctx context.Context, ns string) ([]string, error) {
 func serial(c *x509.Certificate) string { return c.SerialNumber.Text(16) }
 
 func TestTSAInstall(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	opns := createNamespace(t, "op")
 	startOperator(t, opns, nil)
@@ -538,6 +542,7 @@ func issue(t *testing.T, ca *pki.CA, a pqcv1alpha1.Algorithm) *pki.TSAChain {
 // Restored keys are used as they are, even at a parameter set other than
 // spec.tsa.signing.algorithm: that names only the next key.
 func TestExistingSignerIsUsed(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "existing")
@@ -570,6 +575,7 @@ func TestExistingSignerIsUsed(t *testing.T) {
 // A signer not issued by the instance's CA is reported, not used or
 // replaced.
 func TestInvalidSignerDegrades(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "invalid")
@@ -630,6 +636,7 @@ func signerStatus(cr *pqcv1alpha1.SecureSignPQC) string {
 // the same CA, moves the pods to it, and deletes the old private key only
 // once every pod uses the new one.
 func TestTSALeafRotation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "rotate")
@@ -706,6 +713,7 @@ func TestTSALeafRotation(t *testing.T) {
 // The CRD rule sees only old and new spec, so an acceptance can be moved
 // to another generation before the generation is raised.
 func TestWeakerSignerNeedsAcceptance(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "weaker")
@@ -746,6 +754,7 @@ func TestWeakerSignerNeedsAcceptance(t *testing.T) {
 // A recreated instance whose generation is below its newest signer Secret
 // waits for the spec instead of issuing a key and stranding the newer one.
 func TestRecreatedInstanceBehindGeneration(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "recreate")
@@ -805,6 +814,7 @@ func TestRecreatedInstanceBehindGeneration(t *testing.T) {
 // A CA close to expiry is reported, with one Warning event, and does not
 // stop the TSA becoming Ready.
 func TestExpiringCAReported(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "expiring")
@@ -842,6 +852,7 @@ func TestExpiringCAReported(t *testing.T) {
 // The FIPS annotation sets the TSA pods' fips140 mode. A value the TSA would
 // refuse holds the instance and leaves the running pods as they are.
 func TestFIPSAnnotation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "fips")
@@ -896,6 +907,7 @@ func TestFIPSAnnotation(t *testing.T) {
 // The expiry check runs on resync, with no change to the instance: a signer
 // that enters the warning window while nothing else happens is reported.
 func TestExpiryCheckedOnResync(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "resync")
 	root, ca := newCA(t, pqcv1alpha1.MLDSA65)
@@ -993,6 +1005,7 @@ func rotationPending(t *testing.T, ns string, root, intermediate int32, signer s
 // and retires the old signer and intermediate once every pod moved. The
 // old intermediate stays in the trusted root with a validity end.
 func TestTSAIntermediateRotation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "introtate")
@@ -1059,6 +1072,7 @@ func TestTSAIntermediateRotation(t *testing.T) {
 // signer, and once they are in use deletes every old private key, the old
 // root's included. The old chain stays in the trusted root.
 func TestTSARootRotation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "rootrotate")
@@ -1104,6 +1118,7 @@ func TestTSARootRotation(t *testing.T) {
 // intermediate rotation is refused until a root rotation, which retires
 // the old CA.
 func TestDeletedRootKeyNeedsRootRotation(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "rootkey")
@@ -1153,6 +1168,7 @@ func TestDeletedRootKeyNeedsRootRotation(t *testing.T) {
 // A raise while a CA rotation rolls out waits, with one event, and starts
 // once the rotation finishes.
 func TestCARotationHeld(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "held")
@@ -1202,6 +1218,7 @@ func TestCARotationHeld(t *testing.T) {
 // A weaker CA needs an acceptance naming its rotation; that acceptance also
 // covers the signer the rotation issues.
 func TestWeakerCANeedsAcceptance(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "weakerca")

@@ -29,6 +29,7 @@ func tsaDeploymentOf(ctx context.Context, ns string) (*appsv1.Deployment, error)
 // blocks the instance until the options change, and a Deployment that
 // cannot create its pods is reported in TSAReady.
 func TestPodOptions(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	startOperator(t, createNamespace(t, "op"), nil)
 	ns := createNamespace(t, "podopts")

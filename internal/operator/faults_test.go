@@ -97,6 +97,7 @@ var deployments = schema.GroupResource{Group: "apps", Resource: "deployments"}
 
 // 403, 409, 429, 500, 503 and 504 responses.
 func TestAPIErrorsDegradeAndRecover(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	f := &faults{}
 	startOperator(t, createNamespace(t, "op"), func(o *Options) { o.Manager.NewClient = f.newClient })
@@ -168,6 +169,7 @@ func TestAPIErrorsDegradeAndRecover(t *testing.T) {
 
 // A refused spec ends the failing passes, so it clears Degraded.
 func TestBlockedClearsDegraded(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	f := &faults{}
 	startOperator(t, createNamespace(t, "op"), func(o *Options) { o.Manager.NewClient = f.newClient })
@@ -202,6 +204,7 @@ func TestBlockedClearsDegraded(t *testing.T) {
 // The requeue backoff is capped at BackoffMax rather than controller-runtime's
 // 1000 s default, so a persistent fault is retried at least once per cap.
 func TestBackoffCap(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	f := &faults{}
 	f.set(apierrors.NewServiceUnavailable("injected"))
@@ -271,6 +274,7 @@ func setTuning(t *testing.T, ns string, data map[string]string) {
 // event. A valid change to live settings applies in place; one to a setting
 // fixed in the manager asks once for a new manager with it.
 func TestTuningConfigMap(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	opns := createNamespace(t, "op")
 	r := startOperator(t, opns, nil)
@@ -323,6 +327,7 @@ func TestTuningConfigMap(t *testing.T) {
 // Run replaces its manager in the same process for a setting the manager
 // cannot change, and keeps running.
 func TestRunRestartsInProcess(t *testing.T) {
+	freshEnv(t)
 	opns := createNamespace(t, "op")
 	profiles, err := supported.Load()
 	if err != nil {
@@ -374,6 +379,7 @@ func TestRunRestartsInProcess(t *testing.T) {
 // A pass that read an instance since deleted does not write its status onto
 // one recreated under the same name.
 func TestStatusNotWrittenToRecreatedInstance(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	f := &faults{}
 	held, release, result := make(chan struct{}), make(chan struct{}), make(chan error, 1)
@@ -432,6 +438,7 @@ func observedAt(cr *pqcv1alpha1.SecureSignPQC, gen int64, types ...string) error
 // Every condition a pass sets records the generation that pass acted on:
 // a rollout, a failing pass and a blocked spec.
 func TestConditionsObserveTheirGeneration(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	f := &faults{}
 	startOperator(t, createNamespace(t, "op"), func(o *Options) { o.Manager.NewClient = f.newClient })
