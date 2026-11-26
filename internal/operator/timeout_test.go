@@ -18,6 +18,7 @@ import (
 // api_timeout bounds requests, not watch streams: informers keep their
 // watches open well past it instead of reconnecting every api_timeout.
 func TestAPITimeoutLeavesWatchesOpen(t *testing.T) {
+	freshEnv(t)
 	var reqs requests
 	c := reqs.wrap(cfg)
 	watches := &reqs.watches

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
@@ -21,26 +22,79 @@ import (
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/controller"
 )
 
-// reconciles is the controller's reconcile count so far, from the
-// controller-runtime registry every manager in the process shares.
-func reconciles(t *testing.T) float64 {
+// reconciles is sup's reconcile count so far, from the controller-runtime
+// registry every manager in the process shares.
+func reconciles(t *testing.T, sup *supervisor) float64 {
 	t.Helper()
-	return controllerMetric(t, "controller_runtime_reconcile_total")
+	return controllerMetric(t, sup, "controller_runtime_reconcile_total")
 }
 
-// activeWorkers is how many of the controller's reconciles are running.
-func activeWorkers(t *testing.T) float64 {
+// activeWorkers is how many of sup's reconciles are running.
+func activeWorkers(t *testing.T, sup *supervisor) float64 {
 	t.Helper()
-	return controllerMetric(t, "controller_runtime_active_workers")
+	return controllerMetric(t, sup, "controller_runtime_active_workers")
 }
 
-func controllerMetric(t *testing.T, name string) float64 {
+// reconcileResults is sup's reconcile count by result.
+func reconcileResults(t *testing.T, sup *supervisor) map[string]float64 {
 	t.Helper()
-	return metricValue(t, metrics.Registry, name, map[string]string{"controller": "securesignpqc"})
+	return metricByLabel(t, metrics.Registry, "controller_runtime_reconcile_total", "result", map[string]string{"controller": sup.controller})
+}
+
+// reconcileFailures is the operator's failed reconcile count by reason, from
+// its supervisor's registry.
+func reconcileFailures(t *testing.T, g prometheus.Gatherer) map[string]float64 {
+	t.Helper()
+	return metricByLabel(t, g, "pqc_operator_reconcile_failures_total", "reason", nil)
+}
+
+func metricByLabel(t *testing.T, g prometheus.Gatherer, name, label string, match map[string]string) map[string]float64 {
+	t.Helper()
+	mfs, err := g.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.Metric {
+			labels := map[string]string{}
+			for _, l := range m.Label {
+				labels[l.GetName()] = l.GetValue()
+			}
+			matched := true
+			for k, v := range match {
+				matched = matched && labels[k] == v
+			}
+			if matched {
+				out[labels[label]] += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return out
+}
+
+// countsSince is the non-zero growth of each count since before.
+func countsSince(now, before map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range now {
+		if d := v - before[k]; d != 0 {
+			out[k] = d
+		}
+	}
+	return out
+}
+
+func controllerMetric(t *testing.T, sup *supervisor, name string) float64 {
+	t.Helper()
+	return metricValue(t, metrics.Registry, name, map[string]string{"controller": sup.controller})
 }
 
 // The API server accepts connections but never answers.
 func TestResilienceAPIServerSilent(t *testing.T) {
+	freshEnv(t)
 	settings := resilienceSettings()
 	settings.APITimeout = 2 * time.Second
 	p := newAPIProxy(t, "silent")
@@ -114,11 +168,11 @@ func slowest(ds []time.Duration) time.Duration {
 
 // settled waits until no reconcile is running and the reconcile count has
 // held still for 3 s.
-func settled(t *testing.T, timeout time.Duration) {
+func settled(t *testing.T, sup *supervisor, timeout time.Duration) {
 	t.Helper()
-	last, since := reconciles(t), time.Now()
+	last, since := reconciles(t, sup), time.Now()
 	eventually(t, timeout, "reconciles settled", func() error {
-		if n := reconciles(t); n != last || activeWorkers(t) > 0 {
+		if n := reconciles(t, sup); n != last || activeWorkers(t, sup) > 0 {
 			last, since = n, time.Now()
 		}
 		if time.Since(since) < 3*time.Second {
@@ -130,6 +184,7 @@ func settled(t *testing.T, timeout time.Duration) {
 
 // Watch streams cut.
 func TestResilienceWatchesCut(t *testing.T) {
+	freshEnv(t)
 	settings := resilienceSettings()
 	p := newAPIProxy(t, "cut")
 	var reqs requests
@@ -207,6 +262,7 @@ func TestResilienceWatchesCut(t *testing.T) {
 // A slow API server, 2 s added to every response and the
 // bandwidth cut.
 func TestResilienceSlowAPIServer(t *testing.T) {
+	freshEnv(t)
 	install := func(t *testing.T, name string, slow bool) (float64, int64) {
 		settings := resilienceSettings()
 		p := newAPIProxy(t, name)
@@ -217,13 +273,16 @@ func TestResilienceSlowAPIServer(t *testing.T) {
 		var reqs requests
 		opns := createNamespace(t, "op")
 		sup := supervise(t, supervisorOptions{restCfg: reqs.wrap(p.restConfig()), namespace: opns, env: settings})
-		eventually(t, 2*time.Minute, "operator leading", func() error {
-			if reqs.count.Load() == 0 {
-				return fmt.Errorf("no requests yet")
+		// Counting starts from a quiet operator: leading, with every
+		// informer's list in and its watch open.
+		holder := leaseHolder(opns)
+		eventually(t, 5*time.Minute, "operator leading and synced", func() error {
+			if h, err := holder(); err != nil || h != "operator" {
+				return fmt.Errorf("lease held by %q: %v", h, err)
 			}
-			return nil
+			return reqs.watching("securesignpqcs", "deployments", "services", "ingresses", "secrets", "configmaps")
 		})
-		// Instances left by other tests would be reconciled too.
+		// An instance left by the fast run would be reconciled too.
 		var all pqcv1alpha1.SecureSignPQCList
 		if err := k8s.List(context.Background(), &all); err != nil {
 			t.Fatal(err)
@@ -231,17 +290,22 @@ func TestResilienceSlowAPIServer(t *testing.T) {
 		if len(all.Items) != 0 {
 			t.Fatalf("%d instances already exist; the counts would include them", len(all.Items))
 		}
-		// Owned objects outlive their deleted instances (envtest has no
-		// garbage collector), and each enqueues a reconcile at start-up.
-		settled(t, time.Minute)
+		// Start-up reconciles are not counted.
+		settled(t, sup, time.Minute)
 		ns := createNamespace(t, name)
-		r0, q0 := reconciles(t), reqs.count.Load()
+		// Lease renewals run at the retry period however long the install
+		// takes, so the reconciler's requests are counted without them.
+		r0, q0, l0 := reconciles(t, sup), reqs.count.Load(), reqs.leases.Load()
+		c0, o0, f0 := reqs.byCall(), reconcileResults(t, sup), reconcileFailures(t, sup.reg)
 		start := time.Now()
 		installReady(t, ns, 10*time.Minute)
 		ready := time.Since(start)
-		settled(t, 5*time.Minute)
-		r, q := reconciles(t)-r0, reqs.count.Load()-q0
-		t.Logf("%s: Ready in %s, %v reconciles, %d requests", name, ready.Round(time.Millisecond), r, q)
+		settled(t, sup, 5*time.Minute)
+		l := reqs.leases.Load() - l0
+		r, q := reconciles(t, sup)-r0, reqs.count.Load()-q0-l
+		t.Logf("%s: Ready in %s, %v reconciles, %d requests and %d lease calls", name, ready.Round(time.Millisecond), r, q, l)
+		t.Logf("%s: reconcile results %v, failures %v", name, countsSince(reconcileResults(t, sup), o0), countsSince(reconcileFailures(t, sup.reg), f0))
+		t.Logf("%s: requests by call:%s", name, reqs.callsSince(c0))
 		if r == 0 {
 			t.Fatalf("%s: no reconcile counted", name)
 		}

@@ -16,6 +16,7 @@ import (
 
 // The operator's ClusterRoleBinding deleted, then restored.
 func TestResilienceRBACRemoved(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	settings := resilienceSettings()
 	settings.BackoffMax = 10 * time.Second

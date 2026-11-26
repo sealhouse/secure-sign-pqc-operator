@@ -91,6 +91,7 @@ func endpointIs(ctx context.Context, ns string, check func(map[string]any) error
 // verifying a service-ca certificate, or skipping verification of a
 // self-signed one.
 func TestServiceMonitor(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	opns := createNamespace(t, "op")
 	userCfg, _ := operatorUser(t, opns)
@@ -376,6 +377,7 @@ func TestMetricsCertFollowsFiles(t *testing.T) {
 // The metrics server presents the mounted certificate once it appears,
 // without a restart.
 func TestMetricsEndpointServesMountedCert(t *testing.T) {
+	freshEnv(t)
 	port, err := freePort()
 	if err != nil {
 		t.Fatal(err)

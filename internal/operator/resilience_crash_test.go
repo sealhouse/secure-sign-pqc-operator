@@ -20,7 +20,14 @@ import (
 
 // A crash at every write.
 func TestResilienceCrashAtEveryWrite(t *testing.T) {
-	writes, want, _ := crashInstall(t, "crash-base", 0, false)
+	freshEnv(t)
+	// Each install runs in its own subtest, so its namespaces are swept
+	// before the next operator starts.
+	var writes []write
+	var want []string
+	if !t.Run("uninterrupted", func(t *testing.T) { writes, want, _ = crashInstall(t, "crash-base", 0, false) }) {
+		return
+	}
 	if len(writes) == 0 {
 		t.Fatal("the uninterrupted install made no writes")
 	}
@@ -36,8 +43,15 @@ func TestResilienceCrashAtEveryWrite(t *testing.T) {
 				// apply, status, one per event that reaches it, and
 				// coalesced events make fewer rounds: an install can end
 				// before write n.
-				for range 3 {
-					got, objects, crashed := crashInstall(t, name, n, landed)
+				for attempt := range 3 {
+					var got []write
+					var objects []string
+					var crashed bool
+					if !t.Run(fmt.Sprintf("attempt-%d", attempt+1), func(t *testing.T) {
+						got, objects, crashed = crashInstall(t, name, n, landed)
+					}) {
+						return
+					}
 					if !crashed {
 						t.Logf("install ended after %d writes, before write %d; retrying", len(got), n)
 						continue

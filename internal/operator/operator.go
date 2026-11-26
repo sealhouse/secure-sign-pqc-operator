@@ -59,6 +59,9 @@ type Options struct {
 	// LeaderElectionIdentity is the holder name written to the Lease, the
 	// pod's name in a cluster.
 	LeaderElectionIdentity string
+	// ControllerName names the controller and labels its metrics; empty is
+	// controller.ControllerName.
+	ControllerName string
 	// Registry receives the pqc_operator_config metric; nil means the
 	// controller-runtime registry.
 	Registry prometheus.Registerer
@@ -141,6 +144,7 @@ func NewManager(cfg *rest.Config, o Options, restart func(tuning.Settings)) (man
 
 	recorder := mgr.GetEventRecorder(controller.ManagedBy)
 	if err := (&controller.SecureSignPQCReconciler{
+		Name:      o.ControllerName,
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Recorder:  recorder,

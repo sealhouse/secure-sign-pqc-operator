@@ -27,6 +27,7 @@ func leaseHolder(opns string) func() (string, error) {
 
 // The leader cut off from the API server.
 func TestResilienceLeaderCutOff(t *testing.T) {
+	freshEnv(t)
 	settings := resilienceSettings()
 	// Resyncs keep the cut-off leader reconciling until it exits.
 	settings.SyncPeriod = 2 * time.Second

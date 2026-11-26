@@ -66,6 +66,7 @@ func tsaObjects(t *testing.T, ns string) (*appsv1.Deployment, *corev1.Service) {
 }
 
 func TestRepeatedReconcileWritesNothing(t *testing.T) {
+	freshEnv(t)
 	ns := createNamespace(t, "noop")
 	reconcileReady(t, ns)
 	versions := func() []string {
@@ -81,6 +82,7 @@ func TestRepeatedReconcileWritesNothing(t *testing.T) {
 }
 
 func TestStatusIsApplied(t *testing.T) {
+	freshEnv(t)
 	ns := createNamespace(t, "status")
 	reconcileReady(t, ns)
 	applied := false
@@ -100,6 +102,7 @@ func TestStatusIsApplied(t *testing.T) {
 }
 
 func TestApplyOwnership(t *testing.T) {
+	freshEnv(t)
 	ctx := context.Background()
 	ns := createNamespace(t, "ownership")
 	reconcileReady(t, ns)
@@ -157,6 +160,7 @@ func (s staleCR) Get(ctx context.Context, key client.ObjectKey, obj client.Objec
 // A pass that follows a retirement must not lose the retired key's record,
 // however far the cache lags.
 func TestStaleCacheKeepsRetiredKey(t *testing.T) {
+	freshEnv(t)
 	ns := createNamespace(t, "stale")
 	reconcileReady(t, ns)
 	setSpec(t, ns, func(s *pqcv1alpha1.SecureSignPQCSpec) {

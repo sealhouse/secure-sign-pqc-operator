@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -53,9 +54,15 @@ import (
 	"github.com/sealhouse/secure-sign-pqc-operator/internal/versions"
 )
 
+// ControllerName names the controller, and labels its metrics, unless the
+// reconciler sets Name.
+const ControllerName = "securesignpqc"
+
 // SecureSignPQCReconciler reconciles a SecureSignPQC object
 type SecureSignPQCReconciler struct {
 	client.Client
+	// Name names the controller; empty is ControllerName.
+	Name string
 	// APIReader reads straight from the API server.
 	APIReader client.Reader
 	Recorder  events.EventRecorder
@@ -395,6 +402,6 @@ func (r *SecureSignPQCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: r.Settings.Load().ConcurrentReconciles,
 			RateLimiter:             RateLimiter(r.Settings),
 		}).
-		Named("securesignpqc").
+		Named(cmp.Or(r.Name, ControllerName)).
 		Complete(r)
 }
