@@ -98,3 +98,5 @@ require (
 
 // The generator reads the version profiles built into the operator.
 replace github.com/sealhouse/secure-sign-pqc-operator => ../..
+
+replace github.com/coreos/go-oidc/v3 => github.com/sealhouse/go-oidc/v3 v3.21.1-rhtas.1
