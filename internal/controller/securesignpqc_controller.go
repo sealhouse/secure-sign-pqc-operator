@@ -123,7 +123,14 @@ func (r *SecureSignPQCReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	ready := true
 	var err error
-	if profile.Has(versions.CapabilityTSA) {
+	switch {
+	case !cr.Spec.Fulcio.Enabled:
+		// Nothing runs for these conditions to describe.
+		for _, t := range []string{pqcv1alpha1.ConditionTSAReady, pqcv1alpha1.ConditionTSAIngressReady,
+			pqcv1alpha1.ConditionTSACARotation, pqcv1alpha1.ConditionCertificatesExpiring} {
+			meta.RemoveStatusCondition(&cr.Status.Conditions, t)
+		}
+	case profile.Has(versions.CapabilityTSA):
 		var ro rollout
 		ro, err = r.reconcileTSA(ctx, &cr, profile)
 		tsaReady := ro.available

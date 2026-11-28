@@ -115,11 +115,15 @@ func TestTimestamp(t *testing.T) {
 	const algorithm = pqcv1alpha1.MLDSA87
 	cr := &pqcv1alpha1.SecureSignPQC{
 		Namespace: namespace, Name: "e2e",
-		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0", TSA: pqcv1alpha1.TSASpec{
-			Signing: pqcv1alpha1.SigningSpec{Algorithm: algorithm},
-			// MicroShift has no cluster ingress domain to default the host from.
-			Ingress: pqcv1alpha1.IngressSpec{Enabled: true, Host: "e2e-tsa." + namespace + ".example.test"},
-		}},
+		Spec: pqcv1alpha1.SecureSignPQCSpec{
+			Version: "2.0",
+			Fulcio:  pqcv1alpha1.FulcioSpec{Enabled: true},
+			TSA: pqcv1alpha1.TSASpec{
+				Signing: pqcv1alpha1.SigningSpec{Algorithm: algorithm},
+				// MicroShift has no cluster ingress domain to default the host from.
+				Ingress: pqcv1alpha1.IngressSpec{Enabled: true, Host: "e2e-tsa." + namespace + ".example.test"},
+			},
+		},
 	}
 	deleteInstance(t, cr)
 	created := time.Now()
@@ -201,7 +205,7 @@ func TestCARotation(t *testing.T) {
 	ctx := t.Context()
 	cr := &pqcv1alpha1.SecureSignPQC{
 		Namespace: namespace, Name: "e2e-rotate",
-		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0"},
+		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0", Fulcio: pqcv1alpha1.FulcioSpec{Enabled: true}},
 	}
 	deleteInstance(t, cr)
 	if err := k8s.Create(ctx, cr); err != nil {

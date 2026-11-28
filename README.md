@@ -9,6 +9,12 @@ channel, and the API may change.
 
 ## What an instance gets
 
+Certificate signing is off by default. `spec.fulcio.enabled` turns on
+Fulcio and the TSA together: Fulcio's certificates last minutes, so a
+signature made with one verifies only with a timestamp from the TSA. Once on
+it cannot be turned off. Until Fulcio is added, it deploys the TSA alone.
+Off, the instance runs no TSA and has no TSA conditions. On, it gets:
+
 - A root CA, an intermediate CA and a TSA signing key, each in a Secret in
   the instance's namespace: `<name>-tsa-root-<r>`,
   `<name>-tsa-intermediate-<r>-<i>` and `<name>-tsa-signer-<r>-<i>-<s>`.
@@ -78,6 +84,8 @@ metadata:
   name: demo
 spec:
   version: "2.0"
+  fulcio:
+    enabled: true
   tsa:
     signing:
       algorithm: ML-DSA-65

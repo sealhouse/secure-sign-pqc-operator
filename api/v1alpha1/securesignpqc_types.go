@@ -43,10 +43,26 @@ type SecureSignPQCSpec struct {
 	// +required
 	Version string `json:"version"`
 
-	// tsa configures the RFC 3161 timestamp authority.
+	// fulcio enables certificate signing: Fulcio and the timestamp
+	// authority that dates the signatures its short-lived certificates make.
+	// +kubebuilder:default={}
+	// +optional
+	Fulcio FulcioSpec `json:"fulcio,omitzero"`
+
+	// tsa configures the RFC 3161 timestamp authority, which runs only while
+	// spec.fulcio is enabled.
 	// +kubebuilder:default={}
 	// +optional
 	TSA TSASpec `json:"tsa,omitzero"`
+}
+
+// FulcioSpec enables certificate signing.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.enabled) || !oldSelf.enabled || (has(self.enabled) && self.enabled)",message="fulcio cannot be disabled"
+type FulcioSpec struct {
+	// enabled deploys Fulcio and the timestamp authority. It cannot be
+	// turned off again.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 }
 
 // SigningSpec configures a component's CA and signing keys.
@@ -321,7 +337,8 @@ const (
 	ConditionReady = "Ready"
 	// ConditionDegraded is True after repeated reconcile failures.
 	ConditionDegraded = "Degraded"
-	// ConditionTSAReady is True when the timestamp authority is available.
+	// ConditionTSAReady is True when the timestamp authority is available;
+	// it is absent unless spec.fulcio is enabled.
 	ConditionTSAReady = "TSAReady"
 	// ConditionTSAIngressReady is True when the TSA Ingress is applied; it is
 	// absent unless spec.tsa.ingress is enabled.

@@ -109,6 +109,7 @@ func TestSoak(t *testing.T) {
 		Namespace: namespace, Name: soakInstance,
 		Spec: pqcv1alpha1.SecureSignPQCSpec{
 			Version: "2.0",
+			Fulcio:  pqcv1alpha1.FulcioSpec{Enabled: true},
 			TSA:     pqcv1alpha1.TSASpec{Signing: pqcv1alpha1.SigningSpec{Algorithm: pqcv1alpha1.MLDSA65}},
 		},
 	}

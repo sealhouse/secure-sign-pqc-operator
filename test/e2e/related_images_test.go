@@ -54,7 +54,7 @@ func TestOperandImageFromCSV(t *testing.T) {
 
 	cr := &pqcv1alpha1.SecureSignPQC{
 		Namespace: namespace, Name: "related-image",
-		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: v2_0.Version},
+		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: v2_0.Version, Fulcio: pqcv1alpha1.FulcioSpec{Enabled: true}},
 	}
 	deleteInstance(t, cr)
 	if err := k8s.Create(ctx, cr); err != nil {
