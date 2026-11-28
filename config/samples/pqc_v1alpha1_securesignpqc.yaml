@@ -4,6 +4,8 @@ metadata:
   name: securesignpqc-sample
 spec:
   version: "2.0"
+  fulcio:
+    enabled: true
   tsa:
     signing:
       algorithm: ML-DSA-65

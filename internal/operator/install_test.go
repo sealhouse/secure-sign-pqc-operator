@@ -34,7 +34,7 @@ import (
 func newInstance(ns string) *pqcv1alpha1.SecureSignPQC {
 	return &pqcv1alpha1.SecureSignPQC{
 		Namespace: ns, Name: "demo",
-		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0"},
+		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0", Fulcio: pqcv1alpha1.FulcioSpec{Enabled: true}},
 	}
 }
 
@@ -108,6 +108,71 @@ func TestCRDDefaultsAndValidation(t *testing.T) {
 	}
 	if err := k8s.Create(ctx, &pqcv1alpha1.SecureSignPQC{Namespace: ns, Name: strings.Repeat("a", 59), Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0"}}); err != nil {
 		t.Errorf("59-character name: %v", err)
+	}
+}
+
+// spec.fulcio is off by default, deploying no TSA and leaving no TSA
+// conditions; turned on, the TSA comes up, and it cannot be turned off.
+func TestFulcioSwitch(t *testing.T) {
+	freshEnv(t)
+	ctx := context.Background()
+	opns := createNamespace(t, "op")
+	startOperator(t, opns, nil)
+	ns := createNamespace(t, "fulcio")
+	cr := newInstance(ns)
+	cr.Spec.Fulcio = pqcv1alpha1.FulcioSpec{}
+	if err := k8s.Create(ctx, cr); err != nil {
+		t.Fatal(err)
+	}
+	if cr.Spec.Fulcio.Enabled {
+		t.Error("spec.fulcio.enabled defaults to true, want false")
+	}
+	eventually(t, 30*time.Second, "Ready without the TSA", func() error {
+		return conditionIs(getCR(t, ns), pqcv1alpha1.ConditionReady, metav1.ConditionTrue, "AllComponentsReady")
+	})
+	for _, c := range getCR(t, ns).Status.Conditions {
+		if c.Type != pqcv1alpha1.ConditionReady && c.Type != pqcv1alpha1.ConditionDegraded {
+			t.Errorf("condition %s set with spec.fulcio off", c.Type)
+		}
+	}
+	err := k8s.Get(ctx, client.ObjectKey{Namespace: ns, Name: controller.TSAName("demo")}, &appsv1.Deployment{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("TSA Deployment with spec.fulcio off: got %v, want NotFound", err)
+	}
+	var secrets corev1.SecretList
+	if err := k8s.List(ctx, &secrets, client.InNamespace(ns), client.HasLabels{controller.LabelKeyRole}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets.Items) != 0 {
+		t.Errorf("%d key Secrets with spec.fulcio off, want none", len(secrets.Items))
+	}
+
+	cr = getCR(t, ns)
+	cr.Spec.Fulcio.Enabled = true
+	if err := k8s.Update(ctx, cr); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "TSA Deployment", func() error {
+		return k8s.Get(ctx, client.ObjectKey{Namespace: ns, Name: controller.TSAName("demo")}, &appsv1.Deployment{})
+	})
+	markAvailable(t, ns)
+	eventually(t, 30*time.Second, "Ready with the TSA", func() error {
+		cr := getCR(t, ns)
+		if err := conditionIs(cr, pqcv1alpha1.ConditionTSAReady, metav1.ConditionTrue, "Available"); err != nil {
+			return err
+		}
+		return conditionIs(cr, pqcv1alpha1.ConditionReady, metav1.ConditionTrue, "AllComponentsReady")
+	})
+
+	for name, edit := range map[string]func(*pqcv1alpha1.SecureSignPQC){
+		"disable": func(c *pqcv1alpha1.SecureSignPQC) { c.Spec.Fulcio.Enabled = false },
+		"remove":  func(c *pqcv1alpha1.SecureSignPQC) { c.Spec.Fulcio = pqcv1alpha1.FulcioSpec{} },
+	} {
+		c := getCR(t, ns)
+		edit(c)
+		if err := k8s.Update(ctx, c); !apierrors.IsInvalid(err) {
+			t.Errorf("%s spec.fulcio: got %v, want Invalid", name, err)
+		}
 	}
 }
 

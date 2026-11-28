@@ -97,7 +97,7 @@ func installUpgrade(ctx context.Context) error {
 
 	cr := &pqcv1alpha1.SecureSignPQC{
 		Namespace: u.instance.Namespace, Name: u.instance.Name,
-		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0"},
+		Spec: pqcv1alpha1.SecureSignPQCSpec{Version: "2.0", Fulcio: pqcv1alpha1.FulcioSpec{Enabled: true}},
 	}
 	if err := k8s.Create(ctx, cr); err != nil {
 		return err
@@ -141,6 +141,12 @@ func installUpgrade(ctx context.Context) error {
 		return err
 	}
 
+	for _, c := range []*pqcv1alpha1.SecureSignPQC{cr, nonDefault} {
+		if err := enableFulcio(ctx, c); err != nil {
+			return err
+		}
+	}
+
 	// The new operator reconciles the instance it inherited.
 	u.readyAfter = waitReady(ctx, cr) == nil
 	u.readyConditions = cr.Status.Conditions
@@ -165,6 +171,7 @@ func createNonDefault(ctx context.Context, t *nonDefaultUpgrade) (*pqcv1alpha1.S
 		"metadata":   map[string]any{"namespace": upgradeNamespace, "name": nonDefaultInstance},
 		"spec": map[string]any{
 			"version": "2.0",
+			"fulcio":  map[string]any{"enabled": true},
 			"tsa": map[string]any{"signing": map[string]any{
 				"algorithm":        string(nonDefaultAlgorithm),
 				"signerGeneration": int64(nonDefaultGeneration),
@@ -185,6 +192,17 @@ func createNonDefault(ctx context.Context, t *nonDefaultUpgrade) (*pqcv1alpha1.S
 	var err error
 	t.keysBefore, err = keySecrets(ctx, client.ObjectKeyFromObject(cr))
 	return cr, err
+}
+
+// enableFulcio turns spec.fulcio on for an instance the previous head made.
+// A head without the field pruned it and ran the TSA regardless; the new
+// operator runs it only once spec.fulcio is on, on the keys already there.
+func enableFulcio(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC) error {
+	patch := client.RawPatch(types.MergePatchType, []byte(`{"spec":{"fulcio":{"enabled":true}}}`))
+	if err := k8s.Patch(ctx, cr, patch); err != nil {
+		return fmt.Errorf("enabling spec.fulcio on %s: %w", cr.Name, err)
+	}
+	return nil
 }
 
 // checkNonDefault records the non-default instance on the new operator.
