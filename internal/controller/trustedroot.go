@@ -65,7 +65,12 @@ func (r *SecureSignPQCReconciler) ensureChainRecords(ctx context.Context, cr *pq
 			return nil, err
 		}
 	}
+	return r.listChainRecords(ctx, cr, c, st)
+}
 
+// listChainRecords returns every chain record of c, newest first. With st,
+// a record must match the CA Secret of its generation, if there is one.
+func (r *SecureSignPQCReconciler) listChainRecords(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, c caComponent, st *caState) ([]chainRecord, error) {
 	var list corev1.ConfigMapList
 	if err := r.APIReader.List(ctx, &list, client.InNamespace(cr.Namespace),
 		client.MatchingLabels{LabelInstance: cr.Name, LabelKeyRole: c.roleChain}); err != nil {
@@ -94,8 +99,10 @@ func (r *SecureSignPQCReconciler) ensureChainRecords(ctx context.Context, cr *pq
 			}
 			rec.retiredAt = &t
 		}
-		if k := st.find(g); k != nil && !k.ca.Intermediate.Equal(chain.Intermediate) {
-			return nil, invalidConfigMap(cm.Name, fmt.Errorf("does not match CA Secret %s", k.secret.Name))
+		if st != nil {
+			if k := st.find(g); k != nil && !k.ca.Intermediate.Equal(chain.Intermediate) {
+				return nil, invalidConfigMap(cm.Name, fmt.Errorf("does not match CA Secret %s", k.secret.Name))
+			}
 		}
 		records = append(records, rec)
 	}
@@ -125,47 +132,104 @@ func (r *SecureSignPQCReconciler) markChainRetired(ctx context.Context, cr *pqcv
 	return r.Patch(ctx, &cm, patch)
 }
 
-// componentRecords are one component's chain records, newest first.
+// rootPart is one component's entries in the trusted root.
+type rootPart interface {
+	// component is the name of the component, as rootLoaders lists it.
+	component() string
+	addTo(cr *pqcv1alpha1.SecureSignPQC, tr *prototrustroot.TrustedRoot)
+}
+
+// componentRecords are one CA component's chain records, newest first.
 type componentRecords struct {
 	c       caComponent
 	records []chainRecord
 }
 
-// trustedRoot is the Sigstore trusted root for an instance's CAs: one entry
-// per intermediate, without a leaf, so a signer rotation leaves it
-// unchanged. Signatures and timestamps carry their signing certificate.
-func trustedRoot(cr *pqcv1alpha1.SecureSignPQC, components []componentRecords) ([]byte, error) {
-	tr := &prototrustroot.TrustedRoot{MediaType: trustedRootMediaType}
-	for _, cc := range components {
-		list := cc.c.authorities(tr)
-		// Oldest first, as Sigstore's own trusted roots list them.
-		for _, rec := range slices.Backward(cc.records) {
-			validFor := &protocommon.TimeRange{Start: timestamppb.New(rec.chain.Intermediate.NotBefore)}
-			if rec.retiredAt != nil {
-				validFor.End = timestamppb.New(*rec.retiredAt)
-			}
-			*list = append(*list, &prototrustroot.CertificateAuthority{
-				Subject: &protocommon.DistinguishedName{
-					Organization: rec.chain.Intermediate.Subject.Organization[0],
-					CommonName:   rec.chain.Intermediate.Subject.CommonName,
-				},
-				Uri: cc.c.url(cr),
-				CertChain: &protocommon.X509CertificateChain{Certificates: []*protocommon.X509Certificate{
-					{RawBytes: rec.chain.Intermediate.Raw},
-					{RawBytes: rec.chain.Root.Raw},
-				}},
-				ValidFor: validFor,
-			})
+func (cc componentRecords) component() string { return cc.c.name }
+
+// addTo lists one entry per intermediate, without a leaf, so a signer
+// rotation leaves the trusted root unchanged. Signatures and timestamps
+// carry their signing certificate.
+func (cc componentRecords) addTo(cr *pqcv1alpha1.SecureSignPQC, tr *prototrustroot.TrustedRoot) {
+	list := cc.c.authorities(tr)
+	// Oldest first, as Sigstore's own trusted roots list them.
+	for _, rec := range slices.Backward(cc.records) {
+		validFor := &protocommon.TimeRange{Start: timestamppb.New(rec.chain.Intermediate.NotBefore)}
+		if rec.retiredAt != nil {
+			validFor.End = timestamppb.New(*rec.retiredAt)
 		}
+		*list = append(*list, &prototrustroot.CertificateAuthority{
+			Subject: &protocommon.DistinguishedName{
+				Organization: rec.chain.Intermediate.Subject.Organization[0],
+				CommonName:   rec.chain.Intermediate.Subject.CommonName,
+			},
+			Uri: cc.c.url(cr),
+			CertChain: &protocommon.X509CertificateChain{Certificates: []*protocommon.X509Certificate{
+				{RawBytes: rec.chain.Intermediate.Raw},
+				{RawBytes: rec.chain.Root.Raw},
+			}},
+			ValidFor: validFor,
+		})
+	}
+}
+
+// rootLoader reads one component's entries from the API server.
+type rootLoader struct {
+	component string
+	load      func(context.Context, *SecureSignPQCReconciler, *pqcv1alpha1.SecureSignPQC) (rootPart, error)
+}
+
+// rootLoaders are the components with entries in the trusted root, in the
+// order it lists them. A component's records outlive its Deployment, so
+// each is loaded whether or not the component is enabled.
+var rootLoaders = []rootLoader{
+	{tsaCA.name, func(ctx context.Context, r *SecureSignPQCReconciler, cr *pqcv1alpha1.SecureSignPQC) (rootPart, error) {
+		records, err := r.listChainRecords(ctx, cr, tsaCA, nil)
+		return componentRecords{tsaCA, records}, err
+	}},
+}
+
+// rootParts is every loader's part, with own in place of its component's:
+// the caller's part is fresher than what the API server holds.
+func (r *SecureSignPQCReconciler) rootParts(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, loaders []rootLoader, own rootPart) ([]rootPart, error) {
+	parts := make([]rootPart, 0, len(loaders))
+	found := false
+	for _, l := range loaders {
+		if l.component == own.component() {
+			parts, found = append(parts, own), true
+			continue
+		}
+		p, err := l.load(ctx, r, cr)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, p)
+	}
+	if !found {
+		return nil, fmt.Errorf("component %s has no trusted root loader", own.component())
+	}
+	return parts, nil
+}
+
+// trustedRoot is the Sigstore trusted root of parts.
+func trustedRoot(cr *pqcv1alpha1.SecureSignPQC, parts []rootPart) ([]byte, error) {
+	tr := &prototrustroot.TrustedRoot{MediaType: trustedRootMediaType}
+	for _, p := range parts {
+		p.addTo(cr, tr)
 	}
 	return protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(tr)
 }
 
-// publishTrustedRoot applies the trusted root and returns once it lists
-// c's target, read back from the API server: a component must not issue
-// from a chain clients cannot verify yet.
-func (r *SecureSignPQCReconciler) publishTrustedRoot(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, components []componentRecords, c caComponent, target *pki.CA) error {
-	raw, err := trustedRoot(cr, components)
+// publishTrustedRoot applies the trusted root, with own and every other
+// component's entries, and returns once listed accepts it as read back from
+// the API server: a component must not sign with a key clients cannot
+// verify yet. what names the entry listed looks for.
+func (r *SecureSignPQCReconciler) publishTrustedRoot(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, own rootPart, listed func(*prototrustroot.TrustedRoot) bool, what string) error {
+	parts, err := r.rootParts(ctx, cr, rootLoaders, own)
+	if err != nil {
+		return err
+	}
+	raw, err := trustedRoot(cr, parts)
 	if err != nil {
 		return err
 	}
@@ -185,12 +249,30 @@ func (r *SecureSignPQCReconciler) publishTrustedRoot(ctx context.Context, cr *pq
 	if err := protojson.Unmarshal([]byte(live.Data[TrustedRootKey]), &published); err != nil {
 		return fmt.Errorf("ConfigMap %s: %w", name, err)
 	}
-	for _, ca := range *c.authorities(&published) {
-		if certs := ca.GetCertChain().GetCertificates(); len(certs) > 0 && bytes.Equal(certs[0].GetRawBytes(), target.Intermediate.Raw) {
-			return nil
-		}
+	if !listed(&published) {
+		return fmt.Errorf("trusted root %s does not list %s yet", name, what)
 	}
-	return fmt.Errorf("trusted root %s does not list %s intermediate %s yet", name, c.title, target.Intermediate.SerialNumber.Text(16))
+	return nil
+}
+
+// listsIntermediate reports whether c's entries in tr include target's
+// intermediate.
+func listsIntermediate(c caComponent, target *pki.CA) func(*prototrustroot.TrustedRoot) bool {
+	return func(tr *prototrustroot.TrustedRoot) bool {
+		for _, ca := range *c.authorities(tr) {
+			if certs := ca.GetCertChain().GetCertificates(); len(certs) > 0 && bytes.Equal(certs[0].GetRawBytes(), target.Intermediate.Raw) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// publishCARoot publishes the trusted root with c's records and waits for
+// it to list target's intermediate.
+func (r *SecureSignPQCReconciler) publishCARoot(ctx context.Context, cr *pqcv1alpha1.SecureSignPQC, c caComponent, records []chainRecord, target *pki.CA) error {
+	return r.publishTrustedRoot(ctx, cr, componentRecords{c, records}, listsIntermediate(c, target),
+		fmt.Sprintf("%s intermediate %s", c.title, target.Intermediate.SerialNumber.Text(16)))
 }
 
 // caStatus lists c's roots and intermediates from its chain records, newest
