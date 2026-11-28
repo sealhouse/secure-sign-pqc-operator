@@ -434,7 +434,7 @@ func TestTrustedRoot(t *testing.T) {
 	retired := now.Add(-time.Hour).Truncate(time.Second)
 	a := testCA(t, caGen{1, 1}, now, now, true)
 	b := testCA(t, caGen{2, 1}, now, now, true)
-	raw, err := trustedRoot(testInstance(), []componentRecords{{tsaCA, []chainRecord{
+	raw, err := trustedRoot(testInstance(), []rootPart{componentRecords{tsaCA, []chainRecord{
 		{gen: caGen{2, 1}, chain: b.target.ca},
 		{gen: caGen{1, 1}, chain: a.target.ca, retiredAt: &retired},
 	}}})

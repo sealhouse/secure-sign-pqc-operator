@@ -410,7 +410,7 @@ func (r *SecureSignPQCReconciler) reconcileTSA(ctx context.Context, cr *pqcv1alp
 	if err != nil {
 		return rollout{}, err
 	}
-	if err := r.publishTrustedRoot(ctx, cr, []componentRecords{{tsaCA, records}}, tsaCA, st.target.ca); err != nil {
+	if err := r.publishCARoot(ctx, cr, tsaCA, records, st.target.ca); err != nil {
 		return rollout{}, err
 	}
 	if err := r.Apply(ctx, tsaService(cr), client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
@@ -473,7 +473,7 @@ func (r *SecureSignPQCReconciler) reconcileTSA(ctx context.Context, cr *pqcv1alp
 	if err := r.retireCAs(ctx, tsaCA, st); err != nil {
 		return rollout{}, err
 	}
-	if err := r.publishTrustedRoot(ctx, cr, []componentRecords{{tsaCA, records}}, tsaCA, st.target.ca); err != nil {
+	if err := r.publishCARoot(ctx, cr, tsaCA, records, st.target.ca); err != nil {
 		return rollout{}, err
 	}
 	r.setRotation(cr, tsaCA, st)
